@@ -1,0 +1,20 @@
+{
+    "title": "caf",
+    "time_limit": 134,
+    "display_questions": 12,
+    "passing_score": 12,
+    "questions": [
+        {
+            "question": "аавыф",
+            "type": "single",
+            "options": [
+                "223",
+                "а3",
+                "3кыка"
+            ],
+            "correct": [
+                1
+            ]
+        }
+    ]
+}

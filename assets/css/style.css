@@ -1,0 +1,139 @@
+/* style.css */
+
+/* CSS Variables */
+:root {
+    --primary-color: #4CAF50;
+    --secondary-color: #333;
+    --background-color: #f4f4f9;
+    --input-border-color: #ccc;
+    --timer-color: #d9534f;
+    --white-color: #ffffff;
+    --hover-color: #45a049;
+}
+
+/* Reset and General Styles */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background-color: var(--background-color);
+    color: var(--secondary-color);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+}
+
+/* Main Container */
+.container {
+    width: 90%;
+    max-width: 600px;
+    margin: auto;
+    padding: 20px;
+    background-color: var(--white-color);
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* Header */
+h2 {
+    color: var(--secondary-color);
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+/* Styling for Various Form Containers */
+.login-container,
+.admin-container,
+.manage-tests-container,
+.manage-users-container,
+.view-results-container,
+.edit-test-container {
+    background-color: var(--white-color);
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* Form Elements */
+form label {
+    display: block;
+    margin-top: 10px;
+}
+
+form input[type="text"],
+form input[type="password"],
+form input[type="number"],
+form select {
+    width: 100%;
+    padding: 8px;
+    margin-top: 5px;
+    margin-bottom: 10px;
+    border-radius: 4px;
+    border: 1px solid var(--input-border-color);
+    font-size: 1em;
+}
+
+form button {
+    background-color: var(--primary-color);
+    color: var(--white-color);
+    padding: 10px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    width: 100%;
+    font-size: 16px;
+    transition: background-color 0.3s;
+}
+
+form button:hover {
+    background-color: var(--hover-color);
+}
+
+/* Table Styling */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 20px;
+}
+
+table, th, td {
+    border: 1px solid #ddd;
+}
+
+th, td {
+    padding: 12px;
+    text-align: center;
+}
+
+th {
+    background-color: var(--primary-color);
+    color: var(--white-color);
+}
+
+/* Timer Styling */
+#timer {
+    font-weight: bold;
+    color: var(--timer-color);
+    text-align: center;
+    margin-bottom: 15px;
+    font-size: 1.5em;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    .container {
+        padding: 15px;
+        width: 95%;
+    }
+    h2 {
+        font-size: 1.5em;
+    }
+    form button {
+        font-size: 14px;
+    }
+}

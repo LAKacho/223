@@ -1,0 +1,22 @@
+{
+    "title": "Пример теста по PHP",
+    "time_limit": 1800,
+    "display_questions": 5,
+    "passing_score": 50,
+    "questions": [
+        {
+            "id": 1,
+            "question": "Что такое PHP?",
+            "type": "single",
+            "options": ["Язык программирования", "База данных", "СУБД", "Текстовый редактор"],
+            "correct": [0]
+        },
+        {
+            "id": 2,
+            "question": "Какие языки программирования используются для веб-разработки?",
+            "type": "multiple",
+            "options": ["PHP", "JavaScript", "HTML", "MySQL"],
+            "correct": [0, 1]
+        }
+    ]
+}

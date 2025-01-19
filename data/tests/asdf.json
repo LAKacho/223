@@ -1,0 +1,44 @@
+{
+    "title": "asdf",
+    "time_limit": 22,
+    "display_questions": 22,
+    "passing_score": 22,
+    "questions": [
+        {
+            "id": 1,
+            "question": "фы афаффа",
+            "type": "single",
+            "options": [
+                "123123",
+                "123123"
+            ],
+            "correct": [
+                0
+            ]
+        },
+        {
+            "id": 2,
+            "question": "афафафыа",
+            "type": "single",
+            "options": [
+                "аууаф",
+                "афафуа"
+            ],
+            "correct": [
+                0
+            ]
+        },
+        {
+            "id": 3,
+            "question": "афафуа",
+            "type": "single",
+            "options": [
+                "афуафуа",
+                "фуафуа"
+            ],
+            "correct": [
+                1
+            ]
+        }
+    ]
+}

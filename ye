@@ -39,33 +39,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 ?>
+
 <!DOCTYPE html>
-<html lang="ru">
+<html>
 <head>
     <meta charset="UTF-8">
-    <title>Вход в анкету МПС</title>
+    <title>Вход 360°</title>
     <link href="style_xtvs.css" rel="stylesheet">
     <style>
-        body { font-family: Arial, sans-serif; background:#f9f9f9; }
-        #login { max-width:400px; margin:60px auto; padding:20px; background:#fff; border-radius:6px; box-shadow:0 2px 6px rgba(0,0,0,.1); }
-        #login h2 { margin-bottom:20px; text-align:center; }
-        #inputs input { width:100%; padding:10px; margin-bottom:15px; border:1px solid #ccc; border-radius:4px; }
-        #actions { text-align:center; }
-        #actions input { padding:10px 30px; background:#007bff; border:none; border-radius:4px; color:#fff; font-weight:bold; cursor:pointer; }
-        #actions input:hover { background:#0056b3; }
-        #errorLog { margin-top:10px; color:red; text-align:center; }
+        textarea[name="password"] {
+            resize: none;
+            -webkit-text-security: disc !important;
+        }
     </style>
 </head>
+
 <body>
 <form id="login" method="POST" autocomplete="off"> 
-    <h2>Анкета МПС</h2>
+    <img id="pro" src="4.png" width="187px" height="348px"  alt="foto">
+    <h2>Тестирование</h2>
+    <h2>360&deg;</h2>
+    
     <fieldset id="inputs">
-        <input id="tb" type="text" name="tb" placeholder="Введите табельный номер" required autofocus>   
+        <input id="username" type="text" name="tb" placeholder="Табельный номер" autocomplete="off" autofocus required>   
     </fieldset>
     <fieldset id="actions">
-        <input type="submit" id="submit" value="Войти" name="submit">
+        <input type="submit" id="submit" value="войти" name="submit">
+        <img src="MASH_Security_logo2.svg" width="200px" style="float:left; margin: 0px 0px 0px 100px" alt="logo">
     </fieldset>
-    <div id="errorLog"><?= htmlspecialchars($error, ENT_QUOTES) ?></div>
+    <a href="" id="back">&#169; Шереметьево безопасность</a>
+    <div id="errorLog" class="blink"><?= htmlspecialchars($error, ENT_QUOTES) ?></div>
 </form>
+
+<script>
+document.addEventListener("DOMContentLoaded", error);
+function error() {
+    let err = document.getElementById("errorLog");
+    function a() {
+        err.innerHTML = "";
+    }
+    if(err.innerHTML !== "") {
+        setTimeout(a, 5000);
+    }   
+}
+</script>
 </body>
 </html>

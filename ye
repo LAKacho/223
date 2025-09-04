@@ -1,0 +1,71 @@
+<?php
+// Очистка всех куки
+foreach($_COOKIE as $key => $value) {
+    setcookie($key, '', time() - 3600, '/');
+}
+
+require __DIR__ . '/config.php';
+
+$error = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $tb = $_POST['tb'] ?? '';
+    if ($tb === '') {
+        $error = 'Введите табельный номер';
+    } else {
+        try {
+            $pdoAuth = new PDO(
+                'mysql:host=localhost;dbname=1test_system;charset=utf8mb4',
+                'root', '',
+                [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                ]
+            );
+            $st = $pdoAuth->prepare("SELECT fio FROM list WHERE tb = ? LIMIT 1");
+            $st->execute([$tb]);
+            $row = $st->fetch();
+            if ($row) {
+                setcookie('employee_number', $tb, time() + 3600*24*30, '/');
+                header("Location: opros.php");
+                exit;
+            } else {
+                $error = 'Пользователь с таким табельным номером не найден';
+            }
+        } catch (Throwable $e) {
+            $error = 'Ошибка подключения к базе данных';
+        }
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Вход в анкету МПС</title>
+    <link href="style_xtvs.css" rel="stylesheet">
+    <style>
+        body { font-family: Arial, sans-serif; background:#f9f9f9; }
+        #login { max-width:400px; margin:60px auto; padding:20px; background:#fff; border-radius:6px; box-shadow:0 2px 6px rgba(0,0,0,.1); }
+        #login h2 { margin-bottom:20px; text-align:center; }
+        #inputs input { width:100%; padding:10px; margin-bottom:15px; border:1px solid #ccc; border-radius:4px; }
+        #actions { text-align:center; }
+        #actions input { padding:10px 30px; background:#007bff; border:none; border-radius:4px; color:#fff; font-weight:bold; cursor:pointer; }
+        #actions input:hover { background:#0056b3; }
+        #errorLog { margin-top:10px; color:red; text-align:center; }
+    </style>
+</head>
+<body>
+<form id="login" method="POST" autocomplete="off"> 
+    <h2>Анкета МПС</h2>
+    <fieldset id="inputs">
+        <input id="tb" type="text" name="tb" placeholder="Введите табельный номер" required autofocus>   
+    </fieldset>
+    <fieldset id="actions">
+        <input type="submit" id="submit" value="Войти" name="submit">
+    </fieldset>
+    <div id="errorLog"><?= htmlspecialchars($error, ENT_QUOTES) ?></div>
+</form>
+</body>
+</html>

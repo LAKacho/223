@@ -1,4 +1,3 @@
-
 let GlobalVar = false;
 let __ff_running = false;
 let __ff_detect_started = false;
@@ -15,18 +14,38 @@ window.faceReady = window.faceReady || new Promise(res => { window.faceReadyReso
 
   const start = async () => {
     if (__ff_running) return; __ff_running = true;
-    m.textContent = 'Загружаем модели...';
-    await faceapi.nets.tinyFaceDetector.loadFromUri('camera1/models/');
 
-    if (v.srcObject) { try{ v.pause(); }catch(e){} try{ v.srcObject.getTracks().forEach(t=>t.stop()); }catch(e){} v.srcObject=null; }
-    v.autoplay = false; v.muted = true; if ('playsInline' in v) v.playsInline = true;
+    try {
+      v.autoplay = false; v.muted = true; if ('playsInline' in v) v.playsInline = true;
+      const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:640}, height:{ideal:480}, frameRate:30 }, audio:false });
+      v.srcObject = stream;
+      await new Promise(res => { if (v.readyState>=1) res(); else v.onloadedmetadata = () => res(); });
+      try { await v.play(); } catch(e){}
+    } catch(e) {
+      alert('Ошибка доступа к камере: ' + e.message);
+      return;
+    }
 
-    const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:640}, height:{ideal:480}, frameRate:30 }, audio:false });
-    v.srcObject = stream;
-    await new Promise(res => { if (v.readyState>=1) res(); else v.onloadedmetadata = () => res(); });
-    try { await v.play(); } catch(e){}
+    if (typeof faceapi === 'undefined') {
+      m.textContent = 'face-api недоступна, делаем фото через 5с…';
+      setTimeout(() => snapshotAndSend(v, c, m), 5000);
+      return;
+    }
 
-    detect();
+    try {
+      m.textContent = 'Загружаем модели...';
+      await faceapi.nets.tinyFaceDetector.loadFromUri('camera1/models/');
+    } catch(e) {
+      m.textContent = 'Не удалось загрузить модели, фото через 5с…';
+      setTimeout(() => snapshotAndSend(v, c, m), 5000);
+      return;
+    }
+
+    detect(v, c, m);
+    setTimeout(() => {
+      if (!__ff_detect_started) return;
+      snapshotAndSend(v, c, m);
+    }, 5000);
   };
 
   const detect = () => {
@@ -49,36 +68,39 @@ window.faceReady = window.faceReady || new Promise(res => { window.faceReadyReso
       const fx = x+width/2, fy=y+height/2;
       if (Math.abs(fx-cx)<80 && Math.abs(fy-cy)<80){
         shot = true; clearInterval(timer);
-        m.textContent = 'Делаем фото...';
-        c.width = v.videoWidth; c.height = v.videoHeight;
-        c.getContext('2d').drawImage(v,0,0,c.width,c.height);
-        c.toBlob(async (blob)=>{
-          const fd = new FormData(); fd.append('photo', blob, 'face.jpg');
-          try{
-            const r = await fetch('photoSave.php',{method:'POST',body:fd});
-            if(!r.ok) throw new Error('HTTP '+r.status);
-            const t = (await r.text()).trim();
-            const ok = (t.toLowerCase()==='success' || t==='1' || t.startsWith('{'));
-            if(!ok) throw new Error(t);
-            m.textContent = 'Фото сохранено. Начинаем.';
-            GlobalVar = true;
-            try{ if(window.faceReadyResolve) window.faceReadyResolve(); }catch(e){}
-            try{ window.dispatchEvent(new Event('face-ok')); }catch(e){}
-          }catch(e){
-            m.textContent = 'Ошибка: '+e.message;
-          }
-        }, 'image/jpeg', 0.8);
+        snapshotAndSend(v, c, m);
       } else {
         m.textContent = 'Поместите лицо в центр кадра';
       }
     },300);
   };
 
-  if (typeof faceapi !== 'undefined') {
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
-    else start();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
 })();
+
+function snapshotAndSend(v, c, m){
+  __ff_detect_started = false;
+  m.textContent = 'Делаем фото...';
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(v, 0, 0, c.width, c.height);
+  c.toBlob(async (blob)=>{
+    const fd = new FormData(); fd.append('photo', blob, 'face.jpg');
+    try{
+      const r = await fetch('photoSave.php',{method:'POST',body:fd,credentials:'include'});
+      const t = (await r.text()).trim();
+      const ok = r.ok && (t.toLowerCase()==='success' || t==='1' || t.startsWith('{'));
+      if(!ok) throw new Error((!r.ok ? 'HTTP '+r.status+' ' : '') + t);
+      m.textContent = 'Фото сохранено. Начинаем.';
+      GlobalVar = true;
+      try{ if(window.faceReadyResolve) window.faceReadyResolve(); }catch(e){}
+      try{ window.dispatchEvent(new Event('face-ok')); }catch(e){}
+    }catch(e){
+      m.textContent = 'Ошибка: ' + e.message;
+    }
+  }, 'image/jpeg', 0.85);
+}
 
 window.addEventListener('face-ok', () => { tryStartAfterPhoto(); }, { once:true });
 if (window.GlobalVar === true) { tryStartAfterPhoto(); }

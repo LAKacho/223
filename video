@@ -1,0 +1,227 @@
+
+(function () {
+  'use strict';
+
+  function getCookie(name) {
+    var parts = document.cookie.split(';');
+    for (var i = 0; i < parts.length; i++) {
+      var c = parts[i].trim();
+      if (c.indexOf(name + '=') === 0) {
+        return decodeURIComponent(c.substring(name.length + 1));
+      }
+    }
+    return null;
+  }
+  function $(sel) { return document.querySelector(sel); }
+
+  var proto = Element.prototype;
+  if (!proto.matches) {
+    proto.matches = proto.matchesSelector ||
+                    proto.msMatchesSelector ||
+                    proto.mozMatchesSelector ||
+                    proto.webkitMatchesSelector ||
+                    function (s) {
+                      var m = (this.document || this.ownerDocument).querySelectorAll(s);
+                      var i = m.length;
+                      while (--i >= 0 && m.item(i) !== this) {}
+                      return i > -1;
+                    };
+  }
+  if (!proto.closest) {
+    proto.closest = function (s) {
+      var el = this;
+      while (el && el.nodeType === 1) {
+        if (el.matches(s)) return el;
+        el = el.parentElement || el.parentNode;
+      }
+      return null;
+    };
+  }
+
+  var video   = $('#video');
+  var message = $('#message') || (function () { var d=document.createElement('div'); d.id='message'; d.style.cssText='position:fixed;right:10px;bottom:10px;padding:8px 12px;background:#000;color:#fff;font:14px/1.4 system-ui;border-radius:6px;z-index:9999'; d.textContent='Инициализация камеры...'; document.body.appendChild(d); return d; })();
+  var canvas  = $('#canvas')  || (function () { var c=document.createElement('canvas'); c.id='canvas'; c.style.display='none'; document.body.appendChild(c); return c; })();
+
+  var stream = null;
+  var photoSaved = false;
+  var faceApiReady = false;
+  var stopDetect = false;
+
+  document.addEventListener('click', function (e) {
+    if (photoSaved) return;
+    var t = e.target;
+    if ((t.closest && (t.closest('button28') || t.closest('button29') || t.closest('button30') || t.closest('button31'))) ||
+        (t.classList && (t.classList.contains('next') || t.classList.contains('scan')))) {
+      e.preventDefault(); e.stopPropagation();
+      alert('');
+    }
+  }, true);
+
+  function startCamera() {
+    message.textContent = 'Включаю камеру...';
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error('Браузер не поддерживает камеру'));
+    }
+    var constraints = { video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false };
+    return navigator.mediaDevices.getUserMedia(constraints).then(function (s) {
+      stream = s;
+      video.setAttribute('playsinline', '');
+      video.setAttribute('muted', '');
+      video.autoplay = true;
+      try { video.srcObject = stream; } catch (err) { video.src = window.URL.createObjectURL(stream); }
+
+      return new Promise(function (res) {
+        function onReady() { video.removeEventListener('loadedmetadata', onReady); res(); }
+        if (video.readyState >= 2) res(); else video.addEventListener('loadedmetadata', onReady);
+      }).then(function () {
+        var p = video.play();
+        if (p && typeof p.then === 'function') { return p.catch(function () {}); }
+      }).then(function () {
+        return new Promise(function (res2) {
+          if (video.videoWidth && video.videoHeight) return res2();
+          function onCanPlay(){ video.removeEventListener('canplay', onCanPlay); res2(); }
+          video.addEventListener('canplay', onCanPlay);
+        });
+      }).then(function () {
+        message.textContent = 'Камера включена. Идёт поиск лица...';
+      });
+    });
+  }
+
+  function tryLoadFaceApi() {
+    if (!window.faceapi || !faceapi.nets || !faceapi.nets.tinyFaceDetector) {
+      faceApiReady = false;
+      return Promise.resolve(false);
+    }
+    return faceapi.nets.tinyFaceDetector.loadFromUri('camera1/models/').then(function () {
+      faceApiReady = true;
+      return true;
+    }).catch(function () {
+      faceApiReady = false;
+      return false;
+    });
+  }
+
+  function waitFaceCentered(maxMs) {
+    if (!faceApiReady) return Promise.reject(new Error('face-api недоступна (нет скрипта/моделей).'));
+    var start = Date.now();
+    var timeout = (typeof maxMs === 'number') ? maxMs : 30000;
+    var opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.8 });
+
+    return new Promise(function (resolve, reject) {
+      var id = setInterval(function () {
+        if (stopDetect) { clearInterval(id); reject(new Error('Остановлено.')); return; }
+        if (Date.now() - start > timeout) { clearInterval(id); reject(new Error('Лицо не найдено/не по центру.')); return; }
+
+        faceapi.detectSingleFace(video, opts).then(function (det) {
+          if (det && det.box) {
+            var box = det.box;
+            var x = box.x, y = box.y, w = box.width, h = box.height;
+            var vcx = video.videoWidth / 2, vcy = video.videoHeight / 2;
+            var fcx = x + w / 2, fcy = y + h / 2;
+            var dx = Math.abs(fcx - vcx), dy = Math.abs(fcy - vcy);
+            var threshold = 80;
+            if (dx < threshold && dy < threshold) {
+              clearInterval(id);
+              message.textContent = 'Лицо по центру.';
+              resolve(true);
+            } else {
+              message.textContent = 'Поместите лицо в центр кадра...';
+            }
+          } else {
+            message.textContent = 'Лицо не распознано, смотрим в камеру...';
+          }
+        }).catch(function () { });
+      }, 250);
+    });
+  }
+
+  function takePhotoBlob(quality) {
+    quality = (typeof quality === 'number') ? quality : 0.9;
+    var w = video.videoWidth || 640;
+    var h = video.videoHeight || 480;
+    canvas.width = w;
+    canvas.height = h;
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, w, h);
+    if (canvas.toBlob) {
+      return new Promise(function (resolve) {
+        canvas.toBlob(function (blob) { resolve(blob); }, 'image/jpeg', quality);
+      });
+    } else {
+      var dataURL = canvas.toDataURL('image/jpeg', quality);
+      var byteString = atob(dataURL.split(',')[1]);
+      var ab = new ArrayBuffer(byteString.length);
+      var ia = new Uint8Array(ab);
+      for (var i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
+      return Promise.resolve(new Blob([ab], { type: 'image/jpeg' }));
+    }
+  }
+
+  function postPhoto(url, formData) {
+    if (window.fetch) {
+      return fetch(url, { method: 'POST', body: formData, credentials: 'same-origin' }).then(function (resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        return resp.text();
+      });
+    }
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState === 4) {
+          if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText);
+          else reject(new Error('HTTP ' + xhr.status));
+        }
+      };
+      xhr.send(formData);
+    });
+  }
+
+  function sendPhoto(blob) {
+    var fd = new FormData();
+    fd.append('photo', blob, 'face.jpg');
+    var user = getCookie('id_tpa') || getCookie('user_login') || getCookie('id') || '';
+    if (user) fd.append('user', user);
+    return postPhoto('photoSave.php', fd).then(function (text) {
+      var t = (text || '').trim().toLowerCase();
+      if (t !== 'success') throw new Error(text);
+    });
+  }
+
+  function run() {
+    startCamera()
+      .then(tryLoadFaceApi)
+      .then(function (hasFA) {
+        if (!hasFA) {
+          message.textContent = 'face-api не загружена: фото не будет сделано. Проверьте camera1/face-api.min.js и camera1/models/.';
+          return Promise.reject(new Error('face-api missing'));
+        }
+        return waitFaceCentered(30000);
+      })
+      .then(function () { return takePhotoBlob(0.85); })
+      .then(function (blob) {
+        message.textContent = '';
+        return sendPhoto(blob);
+      })
+      .then(function () {
+        stopDetect = true;
+        photoSaved = true;
+        message.textContent = 'Можете приступать к тестированию.';
+        var snap = document.getElementById('snap');
+        if (snap) snap.textContent = 'ФОТО СОХРАНЕНО';
+      })
+      .catch(function (e) {
+        console.error(e);
+        if (e && e.message) {
+          message.textContent = 'Ошибка: ' + e.message;
+        }
+      });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', run);
+  } else {
+    run();
+  }
+})();

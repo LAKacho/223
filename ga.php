@@ -1,133 +1,23 @@
 <?php
-// export_group_report_xls.php
-// Групповой отчёт (Сотрудник × Роль × Компетенции) → Excel-совместимый .xls (HTML)
-// Считает напрямую из answers, НИЧЕГО не пишет в БД.
-
-// ---------- базовые настройки вывода чисел ----------
-ini_set('serialize_precision', -1);
-ini_set('precision', 15);
-
-// helper: печать числа в Excel без лишних нулей/точки, без округления
-function xls_raw_number($v): string {
-    if ($v === null) return '-';
-    return rtrim(rtrim(sprintf('%.15F', (float)$v), '0'), '.');
-}
+// export_answers_detailed_xls.php
+// Выгрузка всех ответов по процедуре в Excel-совместимый .xls (HTML), без библиотек.
+// Колонки: Оцениваемый • Оценивающий • Роль • Вопрос (текст) • Компетенция • Балл • Комментарий.
 
 require 'config.php';
 
-$procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
+$procedureId  = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
+$includeSelf  = !empty($_GET['include_self']); // 1 — включать самооценку, по умолчанию выключено
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 
-/* ───────── Процедура ───────── */
+// --- Процедура ---
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
 $st->execute([$procedureId]);
-$procedure = $st->fetch() ?: exit('Процедура не найдена');
+$procedure = $st->fetch();
+if (!$procedure) exit('Процедура не найдена');
+$procTitle = $procedure['title'] ?? ('Процедура #'.$procedureId);
 $year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
 
-/* ─────── Компетенции в процедуре ─────── */
-$st = $pdo->prepare("
-  SELECT c.id, c.name
-  FROM procedure_combinations pc
-  JOIN combinations c ON c.id = pc.combination_id
-  WHERE pc.procedure_id = ?
-  ORDER BY c.name
-");
-$st->execute([$procedureId]);
-$competencies = $st->fetchAll(PDO::FETCH_ASSOC);
-if (!$competencies) exit('К процедуре не привязаны компетенции.');
-
-$combIds   = array_map(fn($r)=>(int)$r['id'], $competencies);
-$combNames = [];
-foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
-
-/* ───────── Оцениваемые (targets) ───────── */
-$st = $pdo->prepare("
-  SELECT et.id AS target_id, u.fio
-  FROM evaluation_targets et
-  JOIN users u ON u.id = et.user_id
-  WHERE et.procedure_id = ?
-  ORDER BY u.fio
-");
-$st->execute([$procedureId]);
-$targets = $st->fetchAll(PDO::FETCH_ASSOC);
-if (!$targets) exit('В процедуре нет участников.');
-
-/* ───── Нормализация строк для сопоставления ───── */
-$normalize = function(?string $s): string {
-    if ($s === null) return '';
-    $s = mb_strtolower($s, 'UTF-8');
-    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);   // снять префиксы вида "09.2 "
-    $s = preg_replace('/\s+/u', ' ', trim($s));
-    return $s;
-};
-
-/* ───── Карта "компетенция → вопросы" (map) ───── */
-$map = []; $hasLink = [];
-foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
-
-// 1) Явные связи
-if ($combIds) {
-    $in = implode(',', array_fill(0, count($combIds), '?'));
-    $q  = $pdo->prepare("SELECT combination_id, question_id FROM combination_questions WHERE combination_id IN ($in)");
-    $q->execute($combIds);
-    foreach ($q as $row) {
-        $map[(int)$row['combination_id']][] = (int)$row['question_id'];
-        $hasLink[(int)$row['combination_id']] = true;
-    }
-}
-
-// 2) Fallback: совпадение category ↔ name + синонимы + частичное совпадение
-$needFallback = array_values(array_filter($combIds, fn($cid)=>!$hasLink[$cid]));
-if ($needFallback) {
-    $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
-
-    // нормализованная категория -> список вопрос-id
-    $groupCat = [];
-    foreach ($allQ as $row) {
-        $k = $normalize($row['category']);
-        $groupCat[$k][] = (int)$row['id'];
-    }
-
-    // словарь синонимов: комп → категория вопросов (оба нормализованные)
-    $synRaw = [
-        'ответственность' => 'ответственность за результат',
-        'профессиональные знания замещаемой должности' => 'профессиональные знания ключевой должности',
-        'профессиональные знания должностей, смежных к текущей' => 'профессиональные знания должностей, смежных к текущей должности',
-    ];
-    $syn = [];
-    foreach ($synRaw as $k=>$v) { $syn[$normalize($k)] = $normalize($v); }
-
-    foreach ($needFallback as $cid) {
-        $combNorm = $normalize($combNames[$cid]);
-
-        // 1) точное совпадение
-        $qids = $groupCat[$combNorm] ?? null;
-
-        // 2) по словарю синонимов
-        if (!$qids && isset($syn[$combNorm])) {
-            $alias = $syn[$combNorm];
-            $qids = $groupCat[$alias] ?? null;
-        }
-
-        // 3) частичное совпадение (contains) — берём ближайшее
-        if (!$qids) {
-            $bestKey = null; $bestScore = -1;
-            foreach ($groupCat as $k => $ids) {
-                $score = -1;
-                if (str_contains($k, $combNorm) || str_contains($combNorm, $k)) {
-                    $score = max(strlen($k), strlen($combNorm));
-                }
-                if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
-            }
-            if ($bestKey !== null && $bestScore >= 0) $qids = $groupCat[$bestKey];
-        }
-
-        $map[$cid] = $qids ?: [];
-    }
-}
-
-/* ───── Роли и ярлыки ───── */
-$roles = ['self','manager','colleague','subordinate'];
+// --- Роли (русские ярлыки) ---
 $roleLabel = [
     'self'        => 'Сам',
     'manager'     => 'Руководитель',
@@ -135,96 +25,104 @@ $roleLabel = [
     'subordinate' => 'Подчинённый',
 ];
 
-/* ───── Расчёт средних по роли для каждой компетенции ───── */
-$matrix = []; // [fio][role][comb_id] = float|null
+// --- Данные: только фактически заполненные ответы (JOIN с answers) ---
+$sql = "
+  SELECT 
+      u_t.fio             AS target_fio,
+      u_e.fio             AS evaluator_fio,
+      ep.role             AS role,
+      q.text              AS question_text,
+      q.category          AS question_category,
+      a.score             AS score,
+      a.comment           AS comment
+  FROM evaluation_participants ep
+  JOIN evaluation_targets et    ON et.id = ep.target_id
+  JOIN users u_t                ON u_t.id = et.user_id               -- оцениваемый
+  JOIN users u_e                ON u_e.id = ep.evaluator_id          -- оценивающий
+  JOIN answers a                ON a.participant_id = ep.id          -- только реальные ответы
+  LEFT JOIN questions q         ON q.id = a.question_id
+  WHERE et.procedure_id = ?
+    ".($includeSelf ? "" : "AND ep.role <> 'self'")."
+  ORDER BY 
+    u_t.fio,
+    FIELD(ep.role,'manager','colleague','subordinate','self'),
+    u_e.fio,
+    q.id
+";
+$st = $pdo->prepare($sql);
+$st->execute([$procedureId]);
+$rows = $st->fetchAll(PDO::FETCH_ASSOC);
 
-foreach ($targets as $t) {
-    $fio = $t['fio']; $tid = (int)$t['target_id'];
-    $matrix[$fio] = [];
+// --- Excel-совместимый вывод ---
+$css = "
+.num{mso-number-format:'0';text-align:center}
+.txt{text-align:left}
+.head{font-weight:bold;text-align:center}
+.small{font-size:11px}
+td,th{vertical-align:middle}
+";
 
-    foreach ($roles as $role) {
-        $matrix[$fio][$role] = [];
-        foreach ($combIds as $cid) {
-            $qids = $map[$cid] ?? [];
-            if (!$qids) { $matrix[$fio][$role][$cid] = null; continue; }
-
-            $ph  = implode(',', array_fill(0, count($qids), '?'));
-            $sql = "
-              SELECT AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
-              FROM answers a
-              JOIN evaluation_participants ep ON ep.id = a.participant_id
-              WHERE ep.target_id = ?
-                AND ep.role = ?
-                AND a.question_id IN ($ph)
-            ";
-            $stmt = $pdo->prepare($sql);
-            $params = array_merge([$tid, $role], $qids);
-            $stmt->execute($params);
-            $avg = $stmt->fetchColumn();
-            $matrix[$fio][$role][$cid] = ($avg !== null) ? (float)$avg : null;
-        }
-    }
-}
-
-/* ───── CSS и отдача как .xls ───── */
-$css = '';
-if (is_file(__DIR__.'/34.html')) {
-    $tpl = file_get_contents(__DIR__.'/34.html');
-    if (preg_match('~<style[^>]*>(.*?)</style>~is', $tpl, $m)) $css = $m[1];
-}
-// до 15 знаков после запятой, Excel покажет столько, сколько есть
-$css .= ".num{mso-number-format:'0.###############';text-align:center}
-.txt{text-align:center}.small{font-size:11px}";
-
-$fname = 'group_report_roles_'.$procedureId.'.xls';
+$fname = 'answers_detailed_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
-header('Content-Disposition: attachment; filename="'.$fname.'"');
-// UTF-8 BOM для корректной кириллицы в Excel
-echo "\xEF\xBB\xBF";
+header('Content-Disposition: attachment; filename=\"'.$fname.'\"');
+// UTF-8 BOM для корректной кириллицы
+echo \"\\xEF\\xBB\\xBF\";
 ?>
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
-<title><?= htmlspecialchars($procedure['title']) ?></title>
+<meta charset=\"utf-8\">
+<title><?= htmlspecialchars($procTitle) ?></title>
 <style><?= $css ?></style>
 </head>
 <body>
 
-<table border="0" cellpadding="0" cellspacing="0">
+<table border=\"0\" cellspacing=\"0\" cellpadding=\"3\">
   <tr>
-    <td colspan="<?= 2 + count($competencies) ?>" style="font-weight:bold;">
-      Групповой сравнительный отчёт (по процедуре)
+    <td class=\"head\" colspan=\"7\">Ответы по процедуре: <?= htmlspecialchars($procTitle) ?></td>
+  </tr>
+  <tr>
+    <td class=\"head\" colspan=\"7\"><?= (int)$year ?> г.</td>
+  </tr>
+  <tr><td colspan=\"7\">&nbsp;</td></tr>
+</table>
+
+<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\">
+  <tr>
+    <th class=\"head\">Оцениваемый (ФИО)</th>
+    <th class=\"head\">Оценивающий (ФИО)</th>
+    <th class=\"head\">Роль</th>
+    <th class=\"head\">Вопрос</th>
+    <th class=\"head\">Компетенция</th>
+    <th class=\"head\">Балл</th>
+    <th class=\"head\">Комментарий</th>
+  </tr>
+
+  <?php if (!$rows): ?>
+    <tr><td class=\"txt\" colspan=\"7\">Данных нет (возможно, ещё нет ответов или фильтр исключил все строки).</td></tr>
+  <?php else: ?>
+    <?php foreach ($rows as $r): ?>
+      <tr>
+        <td class=\"txt\"><?= htmlspecialchars($r['target_fio'] ?? '') ?></td>
+        <td class=\"txt\"><?= htmlspecialchars($r['evaluator_fio'] ?? '') ?></td>
+        <td class=\"txt\"><?= htmlspecialchars($roleLabel[$r['role']] ?? $r['role'] ?? '') ?></td>
+        <td class=\"txt\"><?= htmlspecialchars($r['question_text'] ?? '') ?></td>
+        <td class=\"txt\"><?= htmlspecialchars($r['question_category'] ?? '') ?></td>
+        <td class=\"num\"><?= ($r['score'] !== null && $r['score'] !== '') ? (float)$r['score'] : '' ?></td>
+        <td class=\"txt\"><?= htmlspecialchars($r['comment'] ?? '') ?></td>
+      </tr>
+    <?php endforeach; ?>
+  <?php endif; ?>
+</table>
+
+<table border=\"0\" cellspacing=\"0\" cellpadding=\"4\" class=\"small\">
+  <tr><td>&nbsp;</td></tr>
+  <tr>
+    <td>
+      Примечание: выгружаются только фактически заполненные ответы (JOIN с <code>answers</code>).
+      <?php if (!$includeSelf): ?>Самооценка исключена (добавьте <code>&include_self=1</code>, чтобы включить).<?php endif; ?>
     </td>
   </tr>
-  <tr><td colspan="<?= 2 + count($competencies) ?>" style="font-weight:bold;"><?= $year ?> г.</td></tr>
-  <tr><td colspan="<?= 2 + count($competencies) ?>">&nbsp;</td></tr>
-
-  <tr class="rowHead">
-    <td style="font-weight:bold;text-align:center;">Сотрудник</td>
-    <td style="font-weight:bold;text-align:center;">Роль</td>
-    <?php foreach ($competencies as $c): ?>
-      <td style="font-weight:bold;text-align:center;"><?= htmlspecialchars($c['name']) ?></td>
-    <?php endforeach; ?>
-  </tr>
-
-  <?php foreach ($targets as $t): ?>
-    <?php $fio = $t['fio']; $first = true; ?>
-    <?php foreach ($roles as $role): ?>
-      <tr>
-        <td class="txt"><?= $first ? htmlspecialchars($fio) : '' ?></td>
-        <td class="txt"><?= $roleLabel[$role] ?></td>
-        <?php foreach ($competencies as $c):
-              $cid = (int)$c['id'];
-              $v = $matrix[$fio][$role][$cid] ?? null; ?>
-          <?= ($v === null)
-                ? '<td class="txt">-</td>'
-                : '<td class="num">'.xls_raw_number($v).'</td>' ?>
-        <?php endforeach; ?>
-      </tr>
-      <?php $first = false; ?>
-    <?php endforeach; ?>
-  <?php endforeach; ?>
 </table>
 
 </body>

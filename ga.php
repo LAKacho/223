@@ -1,129 +1,83 @@
 <?php
-// export_answers_detailed_xls.php
-// Выгрузка всех ответов по процедуре в Excel-совместимый .xls (HTML), без библиотек.
-// Колонки: Оцениваемый • Оценивающий • Роль • Вопрос (текст) • Компетенция • Балл • Комментарий.
-
 require 'config.php';
 
-$procedureId  = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
-$includeSelf  = !empty($_GET['include_self']); // 1 — включать самооценку, по умолчанию выключено
-if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
+$procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
+if ($procedureId <= 0) { 
+    http_response_code(400); 
+    exit('Нужно передать ?procedure_id='); 
+}
 
-// --- Процедура ---
+// Загружаем процедуру
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
 $st->execute([$procedureId]);
 $procedure = $st->fetch();
 if (!$procedure) exit('Процедура не найдена');
-$procTitle = $procedure['title'] ?? ('Процедура #'.$procedureId);
-$year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
 
-// --- Роли (русские ярлыки) ---
-$roleLabel = [
-    'self'        => 'Сам',
-    'manager'     => 'Руководитель',
-    'colleague'   => 'Коллега',
-    'subordinate' => 'Подчинённый',
-];
+$year = $procedure['start_date'] 
+    ? (new DateTime($procedure['start_date']))->format('Y') 
+    : date('Y');
 
-// --- Данные: только фактически заполненные ответы (JOIN с answers) ---
+// Загружаем все ответы по процедуре
 $sql = "
-  SELECT 
-      u_t.fio             AS target_fio,
-      u_e.fio             AS evaluator_fio,
-      ep.role             AS role,
-      q.text              AS question_text,
-      q.category          AS question_category,
-      a.score             AS score,
-      a.comment           AS comment
-  FROM evaluation_participants ep
-  JOIN evaluation_targets et    ON et.id = ep.target_id
-  JOIN users u_t                ON u_t.id = et.user_id               -- оцениваемый
-  JOIN users u_e                ON u_e.id = ep.evaluator_id          -- оценивающий
-  JOIN answers a                ON a.participant_id = ep.id          -- только реальные ответы
-  LEFT JOIN questions q         ON q.id = a.question_id
-  WHERE et.procedure_id = ?
-    ".($includeSelf ? "" : "AND ep.role <> 'self'")."
-  ORDER BY 
-    u_t.fio,
-    FIELD(ep.role,'manager','colleague','subordinate','self'),
-    u_e.fio,
-    q.id
+SELECT 
+    et.id AS target_id,
+    ut.fio AS target_fio,
+    ue.fio AS evaluator_fio,
+    ep.role,
+    q.text AS question_text,
+    a.score
+FROM answers a
+JOIN evaluation_participants ep ON ep.id = a.participant_id
+JOIN evaluation_targets et ON et.id = ep.target_id
+JOIN users ut ON ut.id = et.user_id         -- оцениваемый
+JOIN users ue ON ue.id = ep.evaluator_id    -- оценщик
+JOIN questions q ON q.id = a.question_id
+WHERE et.procedure_id = ?
+ORDER BY ut.fio, ue.fio, q.id
 ";
 $st = $pdo->prepare($sql);
 $st->execute([$procedureId]);
 $rows = $st->fetchAll(PDO::FETCH_ASSOC);
 
-// --- Excel-совместимый вывод ---
-$css = "
-.num{mso-number-format:'0';text-align:center}
-.txt{text-align:left}
-.head{font-weight:bold;text-align:center}
-.small{font-size:11px}
-td,th{vertical-align:middle}
-";
-
-$fname = 'answers_detailed_'.$procedureId.'.xls';
+// Готовим Excel (на самом деле HTML-таблица с расширением .xls)
+$fname = 'procedure_answers_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
-header('Content-Disposition: attachment; filename=\"'.$fname.'\"');
-// UTF-8 BOM для корректной кириллицы
-echo \"\\xEF\\xBB\\xBF\";
+header('Content-Disposition: attachment; filename="'.$fname.'"');
+echo "\xEF\xBB\xBF"; // BOM для UTF-8
 ?>
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset=\"utf-8\">
-<title><?= htmlspecialchars($procTitle) ?></title>
-<style><?= $css ?></style>
+<meta charset="utf-8">
+<title>Ответы по процедуре <?= htmlspecialchars($procedure['title']) ?></title>
+<style>
+  td, th { border:1px solid #000; padding:4px; }
+  table { border-collapse: collapse; }
+</style>
 </head>
 <body>
-
-<table border=\"0\" cellspacing=\"0\" cellpadding=\"3\">
+<h3>Ответы по процедуре: <?= htmlspecialchars($procedure['title']) ?> (<?= $year ?> г.)</h3>
+<table>
   <tr>
-    <td class=\"head\" colspan=\"7\">Ответы по процедуре: <?= htmlspecialchars($procTitle) ?></td>
+    <th>№</th>
+    <th>Оцениваемый</th>
+    <th>Оценщик</th>
+    <th>Роль</th>
+    <th>Вопрос</th>
+    <th>Балл</th>
   </tr>
+<?php 
+$i=1;
+foreach ($rows as $r): ?>
   <tr>
-    <td class=\"head\" colspan=\"7\"><?= (int)$year ?> г.</td>
+    <td><?= $i++ ?></td>
+    <td><?= htmlspecialchars($r['target_fio']) ?></td>
+    <td><?= htmlspecialchars($r['evaluator_fio']) ?></td>
+    <td><?= htmlspecialchars($r['role']) ?></td>
+    <td><?= htmlspecialchars($r['question_text']) ?></td>
+    <td><?= $r['score'] !== null ? (float)$r['score'] : '-' ?></td>
   </tr>
-  <tr><td colspan=\"7\">&nbsp;</td></tr>
+<?php endforeach; ?>
 </table>
-
-<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\">
-  <tr>
-    <th class=\"head\">Оцениваемый (ФИО)</th>
-    <th class=\"head\">Оценивающий (ФИО)</th>
-    <th class=\"head\">Роль</th>
-    <th class=\"head\">Вопрос</th>
-    <th class=\"head\">Компетенция</th>
-    <th class=\"head\">Балл</th>
-    <th class=\"head\">Комментарий</th>
-  </tr>
-
-  <?php if (!$rows): ?>
-    <tr><td class=\"txt\" colspan=\"7\">Данных нет (возможно, ещё нет ответов или фильтр исключил все строки).</td></tr>
-  <?php else: ?>
-    <?php foreach ($rows as $r): ?>
-      <tr>
-        <td class=\"txt\"><?= htmlspecialchars($r['target_fio'] ?? '') ?></td>
-        <td class=\"txt\"><?= htmlspecialchars($r['evaluator_fio'] ?? '') ?></td>
-        <td class=\"txt\"><?= htmlspecialchars($roleLabel[$r['role']] ?? $r['role'] ?? '') ?></td>
-        <td class=\"txt\"><?= htmlspecialchars($r['question_text'] ?? '') ?></td>
-        <td class=\"txt\"><?= htmlspecialchars($r['question_category'] ?? '') ?></td>
-        <td class=\"num\"><?= ($r['score'] !== null && $r['score'] !== '') ? (float)$r['score'] : '' ?></td>
-        <td class=\"txt\"><?= htmlspecialchars($r['comment'] ?? '') ?></td>
-      </tr>
-    <?php endforeach; ?>
-  <?php endif; ?>
-</table>
-
-<table border=\"0\" cellspacing=\"0\" cellpadding=\"4\" class=\"small\">
-  <tr><td>&nbsp;</td></tr>
-  <tr>
-    <td>
-      Примечание: выгружаются только фактически заполненные ответы (JOIN с <code>answers</code>).
-      <?php if (!$includeSelf): ?>Самооценка исключена (добавьте <code>&include_self=1</code>, чтобы включить).<?php endif; ?>
-    </td>
-  </tr>
-</table>
-
 </body>
 </html>

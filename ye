@@ -1,7 +1,7 @@
 <?php
-// export_group_report_xls.php
-// Групповой отчёт (Сотрудник × Роль × Компетенции) → Excel-совместимый .xls (HTML)
-// Считает напрямую из answers, ничего в БД не пишет.
+// export_competency_breakdown_xls.php
+// Детализированный отчёт: по каждой компетенции показываем средние M/C/S и взвешенный итог.
+// Счёт идёт напрямую из answers, ничего в БД не пишем.
 
 require 'config.php';
 
@@ -28,6 +28,7 @@ $st = $pdo->prepare("
 $st->execute([$procedureId]);
 $competencies = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$competencies) exit('К процедуре не привязаны компетенции.');
+
 $combIds   = array_map(fn($r)=>(int)$r['id'], $competencies);
 $combNames = [];
 foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
@@ -118,43 +119,58 @@ if ($needFallback) {
     }
 }
 
-/* ───── Роли (как в group_report: 4 строки на сотрудника) ───── */
-$roles = ['self','manager','colleague','subordinate'];
-$roleLabel = [
-    'self'        => 'Сам',
-    'manager'     => 'Руководитель',
-    'colleague'   => 'Коллега',
-    'subordinate' => 'Подчинённый',
-];
+/* ───── Роли и веса для взвешенного итога ───── */
+$roles        = ['manager','colleague','subordinate']; // self не учитываем
+$roleLabels   = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
+$roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
 
-/* ───── Расчёт средних по роли для каждой компетенции ───── */
-$matrix = []; // [fio][role][comb_id] = float|null
+/* ───── Расчёт средней по ролям и взвешенного итога для каждой компетенции ─────
+ * results[fio][cid] = ['M'=>?, 'C'=>?, 'S'=>?, 'W'=>?]
+ */
+$results = [];
 
 foreach ($targets as $t) {
     $fio = $t['fio']; $tid = (int)$t['target_id'];
-    $matrix[$fio] = [];
+    $results[$fio] = [];
 
-    foreach ($roles as $role) {
-        $matrix[$fio][$role] = [];
-        foreach ($combIds as $cid) {
-            $qids = $map[$cid] ?? [];
-            if (!$qids) { $matrix[$fio][$role][$cid] = null; continue; }
+    foreach ($combIds as $cid) {
+        $qids = $map[$cid] ?? [];
+        if (!$qids) { $results[$fio][$cid] = ['M'=>null,'C'=>null,'S'=>null,'W'=>null]; continue; }
 
-            $ph  = implode(',', array_fill(0, count($qids), '?'));
-            $sql = "
-              SELECT AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
-              FROM answers a
-              JOIN evaluation_participants ep ON ep.id = a.participant_id
-              WHERE ep.target_id = ?
-                AND ep.role = ?
-                AND a.question_id IN ($ph)
-            ";
-            $stmt = $pdo->prepare($sql);
-            $params = array_merge([$tid, $role], $qids);
-            $stmt->execute($params);
-            $avg = $stmt->fetchColumn();
-            $matrix[$fio][$role][$cid] = ($avg !== null) ? (float)$avg : null;
+        $ph = implode(',', array_fill(0, count($qids), '?'));
+        $sql = "
+          SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
+          FROM answers a
+          JOIN evaluation_participants ep ON ep.id = a.participant_id
+          WHERE ep.target_id = ?
+            AND ep.role IN ('manager','colleague','subordinate')
+            AND a.question_id IN ($ph)
+          GROUP BY ep.role
+        ";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute(array_merge([$tid], $qids));
+
+        $avgByRole = ['manager'=>null,'colleague'=>null,'subordinate'=>null];
+        foreach ($stmt as $r) {
+            if ($r['avg_score'] !== null) $avgByRole[$r['role']] = (float)$r['avg_score'];
         }
+
+        // Взвешенный итог по имеющимся ролям (нормализация весов)
+        $sumW = 0; $sumV = 0;
+        foreach ($roles as $rl) {
+            if ($avgByRole[$rl] !== null) {
+                $sumW += $roleWeights[$rl];
+                $sumV += $roleWeights[$rl] * $avgByRole[$rl];
+            }
+        }
+        $weighted = ($sumW > 0) ? ($sumV / $sumW) : null;
+
+        $results[$fio][$cid] = [
+            'M' => $avgByRole['manager'],
+            'C' => $avgByRole['colleague'],
+            'S' => $avgByRole['subordinate'],
+            'W' => $weighted,
+        ];
     }
 }
 
@@ -165,10 +181,13 @@ if (is_file(__DIR__.'/34.html')) {
     if (preg_match('~<style[^>]*>(.*?)</style>~is', $tpl, $m)) $css = $m[1];
 }
 $fmt = str_repeat('0', max(0,$decimals));
-$css .= ".num{mso-number-format:'0".($decimals?'.'.$fmt:'')."';text-align:center}
-.txt{text-align:center}.small{font-size:11px}";
+$css .= "
+.num{mso-number-format:'0".($decimals?'.'.$fmt:'')."';text-align:center}
+.txt{text-align:center}
+th{font-weight:bold;text-align:center}
+";
 
-$fname = 'group_report_roles_'.$procedureId.'.xls';
+$fname = 'competency_breakdown_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
 header('Content-Disposition: attachment; filename="'.$fname.'"');
 // UTF-8 BOM для корректной кириллицы в Excel
@@ -183,39 +202,41 @@ echo "\xEF\xBB\xBF";
 </head>
 <body>
 
-<table border="0" cellpadding="0" cellspacing="0">
+<table border="1" cellspacing="0" cellpadding="3">
   <tr>
-    <td colspan="<?= 2 + count($competencies) ?>" style="font-weight:bold;">
-      Групповой сравнительный отчёт (по процедуре)
-    </td>
+    <th colspan="<?= 1 + count($competencies)*4 ?>">Детализация оценки по компетенциям (M/C/S + взвешенный итог)</th>
   </tr>
-  <tr><td colspan="<?= 2 + count($competencies) ?>" style="font-weight:bold;"><?= $year ?> г.</td></tr>
-  <tr><td colspan="<?= 2 + count($competencies) ?>">&nbsp;</td></tr>
+  <tr>
+    <th colspan="<?= 1 + count($competencies)*4 ?>"><?= htmlspecialchars($procedure['title']) ?> — <?= $year ?> г.</th>
+  </tr>
 
-  <tr class="rowHead">
-    <td style="font-weight:bold;text-align:center;">Сотрудник</td>
-    <td style="font-weight:bold;text-align:center;">Роль</td>
+  <!-- Заголовок: ФИО + по каждой компетенции 4 колонки -->
+  <tr>
+    <th rowspan="2">Сотрудник</th>
     <?php foreach ($competencies as $c): ?>
-      <td style="font-weight:bold;text-align:center;"><?= htmlspecialchars($c['name']) ?></td>
+      <th colspan="4"><?= htmlspecialchars($c['name']) ?></th>
+    <?php endforeach; ?>
+  </tr>
+  <tr>
+    <?php foreach ($competencies as $c): ?>
+      <th>M</th><th>C</th><th>S</th><th>Итог</th>
     <?php endforeach; ?>
   </tr>
 
-  <?php foreach ($targets as $t): ?>
-    <?php $fio = $t['fio']; $first = true; ?>
-    <?php foreach ($roles as $role): ?>
-      <tr>
-        <td class="txt"><?= $first ? htmlspecialchars($fio) : '' ?></td>
-        <td class="txt"><?= $roleLabel[$role] ?></td>
-        <?php foreach ($competencies as $c):
-              $cid = (int)$c['id'];
-              $v = $matrix[$fio][$role][$cid] ?? null; ?>
-          <?= ($v === null)
-                ? '<td class="txt">-</td>'
-                : '<td class="num">'.number_format((float)$v, $decimals, '.', '').'</td>' ?>
-        <?php endforeach; ?>
-      </tr>
-      <?php $first = false; ?>
-    <?php endforeach; ?>
+  <!-- Данные -->
+  <?php foreach ($results as $fio => $byCid): ?>
+    <tr>
+      <td class="txt"><?= htmlspecialchars($fio) ?></td>
+      <?php foreach ($competencies as $c):
+            $cid = (int)$c['id'];
+            $row = $byCid[$cid] ?? ['M'=>null,'C'=>null,'S'=>null,'W'=>null];
+            $M = $row['M']; $C = $row['C']; $S = $row['S']; $W = $row['W']; ?>
+        <?= ($M === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($M, $decimals, '.', '').'</td>' ?>
+        <?= ($C === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($C, $decimals, '.', '').'</td>' ?>
+        <?= ($S === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($S, $decimals, '.', '').'</td>' ?>
+        <?= ($W === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($W, $decimals, '.', '').'</td>' ?>
+      <?php endforeach; ?>
+    </tr>
   <?php endforeach; ?>
 </table>
 

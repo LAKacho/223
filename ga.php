@@ -1,13 +1,22 @@
 <?php
 // export_group_report_xls.php
-// Групповой отчёт по процедуре (Сотрудник × Роль × Компетенции) → Excel-совместимый .xls (HTML)
-// Берёт данные из answers, ничего в БД не записывает.
+// Групповой отчёт (Сотрудник × Роль × Компетенции) → Excel-совместимый .xls (HTML)
+// Считает напрямую из answers, НИЧЕГО не пишет в БД.
+
+// ---------- базовые настройки вывода чисел ----------
+ini_set('serialize_precision', -1);
+ini_set('precision', 15);
+
+// helper: печать числа в Excel без лишних нулей/точки, без округления
+function xls_raw_number($v): string {
+    if ($v === null) return '-';
+    return rtrim(rtrim(sprintf('%.15F', (float)$v), '0'), '.');
+}
 
 require 'config.php';
 
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
-$decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
 
 /* ───────── Процедура ───────── */
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
@@ -163,13 +172,14 @@ if (is_file(__DIR__.'/34.html')) {
     $tpl = file_get_contents(__DIR__.'/34.html');
     if (preg_match('~<style[^>]*>(.*?)</style>~is', $tpl, $m)) $css = $m[1];
 }
-$fmt = str_repeat('0', max(0,$decimals));
-$css .= ".num{mso-number-format:'0".($decimals?'.'.$fmt:'')."';text-align:center}
+// до 15 знаков после запятой, Excel покажет столько, сколько есть
+$css .= ".num{mso-number-format:'0.###############';text-align:center}
 .txt{text-align:center}.small{font-size:11px}";
 
 $fname = 'group_report_roles_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
 header('Content-Disposition: attachment; filename="'.$fname.'"');
+// UTF-8 BOM для корректной кириллицы в Excel
 echo "\xEF\xBB\xBF";
 ?>
 <!DOCTYPE html>
@@ -209,7 +219,7 @@ echo "\xEF\xBB\xBF";
               $v = $matrix[$fio][$role][$cid] ?? null; ?>
           <?= ($v === null)
                 ? '<td class="txt">-</td>'
-                : '<td class="num">'.number_format((float)$v, $decimals, '.', '').'</td>' ?>
+                : '<td class="num">'.xls_raw_number($v).'</td>' ?>
         <?php endforeach; ?>
       </tr>
       <?php $first = false; ?>

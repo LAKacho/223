@@ -22,7 +22,7 @@ $st->execute([$procedureId]);
 $competencies = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$competencies) exit('К процедуре не привязаны компетенции.');
 
-$combIds   = array_map(fn($r)=>(int)$r['id'], $competencies);
+$combIds   = array_map(function($r){ return (int)$r['id']; }, $competencies);
 $combNames = [];
 foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
 
@@ -40,7 +40,7 @@ if (!$targets) exit('В процедуре нет участников.');
 $normalize = function(?string $s): string {
     if ($s === null) return '';
     $s = mb_strtolower($s, 'UTF-8');
-    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);   
+    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);
     $s = preg_replace('/\s+/u', ' ', trim($s));
     return $s;
 };
@@ -57,7 +57,7 @@ if ($combIds) {
         $hasLink[(int)$row['combination_id']] = true;
     }
 }
-$needFallback = array_values(array_filter($combIds, fn($cid)=>!$hasLink[$cid]));
+$needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
 if ($needFallback) {
     $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -89,8 +89,8 @@ if ($needFallback) {
             $bestKey = null; $bestScore = -1;
             foreach ($groupCat as $k => $ids) {
                 $score = -1;
-                if (str_contains($k, $combNorm) || str_contains($combNorm, $k)) {
-                    $score = max(strlen($k), strlen($combNorm));
+                if (mb_strpos($k, $combNorm) !== false || mb_strpos($combNorm, $k) !== false) {
+                    $score = max(mb_strlen($k, 'UTF-8'), mb_strlen($combNorm, 'UTF-8'));
                 }
                 if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
             }
@@ -101,10 +101,35 @@ if ($needFallback) {
     }
 }
 
+// ---- Роли: базовые веса при наличии всех трёх ----
 $roleList   = ['manager','colleague','subordinate'];
 $roleWeight = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
 
-$matrix = [];   
+// Функция: динамическое взвешивание в зависимости от присутствующих ролей
+function weightedByPresentRoles(array $avgByRole, array $baseWeights): ?float {
+    $present = [];
+    foreach (['manager','colleague','subordinate'] as $r) {
+        if ($avgByRole[$r] !== null) $present[] = $r;
+    }
+    $n = count($present);
+    if ($n === 0) return null;
+
+    if ($n === 3) {
+        // все три роли: используем базовые веса 33.4/33.3/33.3
+        $sum = 0.0;
+        foreach ($present as $r) $sum += $baseWeights[$r] * (float)$avgByRole[$r];
+        return $sum; // базовые веса уже суммируются в 1.0
+    }
+
+    // 2 роли -> 50/50, 1 роль -> 100%
+    $w = 1.0 / $n;
+    $sum = 0.0;
+    foreach ($present as $r) $sum += $w * (float)$avgByRole[$r];
+    return $sum;
+}
+
+// ---- Расчёт матрицы средних по компетенциям ----
+$matrix = [];
 foreach ($targets as $t) {
     $fio = $t['fio']; $tid = (int)$t['target_id'];
     $matrix[$fio] = [];
@@ -124,26 +149,26 @@ foreach ($targets as $t) {
           GROUP BY ep.role
         ";
         $stmt = $pdo->prepare($sql);
-$stmt->execute(array_merge([$tid], $qids));
+        $stmt->execute(array_merge([$tid], $qids));
 
         $avgByRole = ['manager'=>null,'colleague'=>null,'subordinate'=>null];
-        foreach ($stmt as $r) if ($r['avg_score'] !== null) $avgByRole[$r['role']] = (float)$r['avg_score'];
-
-        $sumW = 0; $sumV = 0;
-        foreach ($roleList as $rl) {
-            if ($avgByRole[$rl] !== null) { $sumW += $roleWeight[$rl]; $sumV += $roleWeight[$rl] * $avgByRole[$rl]; }
+        foreach ($stmt as $r) {
+            if ($r['avg_score'] !== null) $avgByRole[$r['role']] = (float)$r['avg_score'];
         }
-        $matrix[$fio][$cid] = ($sumW > 0) ? ($sumV / $sumW) : null;
+
+        // динамическое взвешивание по присутствующим ролям
+        $matrix[$fio][$cid] = weightedByPresentRoles($avgByRole, $roleWeight);
     }
 }
 
-$mgrUnit  = 0.5 / 6.0;   
-$profEach = 0.25;
+// ---- Веса компетенций: 6×8.33% + 2×25% ----
+$mgrUnit  = 0.5 / 6.0;   // 8.333…%
+$profEach = 0.25;        // 25%
 
 $mgrSet  = array_map($normalize, [
   'принятие решений',
-  'ответственность за результат', 
-  'ответственность',              
+  'ответственность за результат', // допускаем оба варианта
+  'ответственность',
   'планирование и контроль',
   'влияние и убеждение',
   'стремление к развитию',
@@ -157,39 +182,39 @@ $prof2Set = array_map($normalize, [
   'профессиональные знания должностей, смежных к текущей',
 ]);
 
-$combWeight = []; 
+$combWeight = [];
 foreach ($combIds as $cid) {
     $n = $normalize($combNames[$cid]);
     if     (in_array($n, $mgrSet,  true)) $combWeight[$cid] = $mgrUnit;
     elseif (in_array($n, $prof1Set, true)) $combWeight[$cid] = $profEach;
     elseif (in_array($n, $prof2Set, true)) $combWeight[$cid] = $profEach;
-    else                                   $combWeight[$cid] = null;
+    else                                   $combWeight[$cid] = null; // если найдётся «лишняя» компетенция — не учитываем в «Итого»
 }
 
-$totals = []; 
+// ---- Итог по сотруднику (взвешивание по компетенциям) ----
+$totals = [];
 foreach ($matrix as $fio => $valsByCid) {
     $sumW = 0; $sumV = 0;
     foreach ($valsByCid as $cid => $v) {
         $w = $combWeight[$cid] ?? null;
         if ($w !== null && $v !== null) { $sumW += $w; $sumV += $w * $v; }
     }
-    $totals[$fio] = ($sumW > 0) ? ($sumV / $sumW) : null; 
+    $totals[$fio] = ($sumW > 0) ? ($sumV / $sumW) : null;
 }
 
+// ---- Классы A–D ----
 $grade = function($score) {
     if ($score === null) return '';
     if ($score >= 2.6) return 'A';
     if ($score >= 2.0) return 'B';
     if ($score >= 1.0) return 'C';
-    return 'D'; 
+    return 'D';
 };
 
-$css = '';
-if (is_file(__DIR__.'/34.html')) {
-    $tpl = file_get_contents(__DIR__.'/34.html');
-    if (preg_match('~<style[^>]*>(.*?)</style>~is', $tpl, $m)) $css = $m[1];
-}
-$css .= ".num{mso-number-format:'0.00'; text-align:center}.txt{text-align:center}.grade{text-align:center;mso-number-format:'\\@'}";
+// ---- Excel (HTML) ----
+$css = ".num{mso-number-format:'0.00'; text-align:center}
+.txt{text-align:center}
+.grade{text-align:center; mso-number-format:'\\@'}";
 
 $fname = 'procedure_report_360_6x2_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
@@ -208,7 +233,7 @@ echo "\xEF\xBB\xBF";
 <table border="0" cellpadding="0" cellspacing="0">
   <tr>
     <td colspan="<?= 3 + count($competencies) ?>" style="font-weight:bold;">
-      Оценка компетенций резервистов методом «360 градусов» (схема весов 6×8,33% + 2×25%)
+      Оценка компетенций резервистов методом «360 градусов» (6×8,33% + 2×25%) с динамическими весами ролей
     </td>
   </tr>
   <tr><td colspan="<?= 3 + count($competencies) ?>" style="font-weight:bold;"><?= $year ?> г.</td></tr>
@@ -225,7 +250,7 @@ echo "\xEF\xBB\xBF";
   <tr class="rowNum">
     <td class="txt">№</td>
     <?php $i=1; foreach ($competencies as $_): ?><td class="txt"><?= $i++ ?></td><?php endforeach; ?>
-<td class="txt"><?= $i ?></td>
+    <td class="txt"><?= $i ?></td>
     <td class="txt"><?= $i+1 ?></td>
   </tr>
 
@@ -247,19 +272,8 @@ echo "\xEF\xBB\xBF";
   <tr><td colspan="<?= 3 + count($competencies) ?>">&nbsp;</td></tr>
   <tr>
     <td colspan="<?= 3 + count($competencies) ?>">
-      Ролевая модель: руководитель 33,4% + коллеги 33,3% + подчинённые 33,3% (self не учитывается).<br>
-      Веса компетенций: 6 управленческих по 8,33% (в сумме 50%) и 2 профессиональные по 25% (в сумме 50%).<br>
-    </td>
-  </tr>
-  <tr><td colspan="<?= 3 + count($competencies) ?>">&nbsp;</td></tr>
-
-  <tr>
-    <td colspan="<?= 3 + count($competencies) ?>">
-      <strong>Расшифровка итоговой оценки:</strong><br>
-      A — 2.6–3.0: демонстрируемый уровень развития компетенций превышает требуемый<br>
-      B — 2.0–2.5: демонстрируемый уровень развития компетенций полностью соответствует требуемому<br>
-      C — 1.0–1.9: демонстрируемый уровень развития компетенций удовлетворительный, некритично ниже требуемого<br>
-      D — 0–0.9: демонстрируемый уровень развития компетенций не соответствует требуемому
+      Роли: при наличии всех трёх — 33,4% / 33,3% / 33,3%; при отсутствии части ролей — оставшиеся делят вес поровну (50/50 или 100%).<br>
+      Компетенции: 6 управленческих по 8,33% (в сумме 50%) и 2 профессиональные по 25% (в сумме 50%).
     </td>
   </tr>
 </table>

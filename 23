@@ -1,0 +1,74 @@
+<?php
+require 'config.php';
+
+$procedure_id = $_GET['procedure_id'] ?? '';
+if (!$procedure_id) {
+    die("Процедура не выбрана.");
+}
+
+$pdo->exec("SET NAMES 'utf8'");
+
+function convertToUtf8($str) {
+    if (mb_detect_encoding($str, 'UTF-8', true)) {
+        return $str;
+    }
+    return mb_convert_encoding($str, 'UTF-8', 'Windows-1251,ISO-8859-5');
+}
+
+$categories = $pdo->query("SELECT DISTINCT category FROM questions ORDER BY category")->fetchAll(PDO::FETCH_COLUMN);
+$categories = array_map('convertToUtf8', $categories);
+
+$roles = [
+    'self' => 'Сам',
+    'manager' => 'Руководитель',
+    'colleague' => 'Коллега',
+    'subordinate' => 'Подчиненный'
+];
+
+$stmt = $pdo->prepare("SELECT et.id AS target_id, u.fio
+    FROM evaluation_targets et
+    JOIN users u ON et.user_id = u.id
+    WHERE et.procedure_id = ?
+    ORDER BY u.fio");
+$stmt->execute([$procedure_id]);
+$targets = $stmt->fetchAll();
+
+header('Content-Type: text/csv; charset=utf-8');
+header("Content-Disposition: attachment; filename=group_report_proc_{$procedure_id}.csv");
+
+$output = fopen('php://output', 'w');
+fwrite($output, "\xEF\xBB\xBF"); 
+
+$headers = ['Сотрудник', 'Роль'];
+foreach ($categories as $cat) {
+    $headers[] = $cat;
+}
+fputcsv($output, $headers);
+
+$avg_stmt = $pdo->prepare("SELECT AVG(a.score) as avg_score
+    FROM answers a
+    JOIN questions q ON a.question_id = q.id
+    JOIN evaluation_participants ep ON a.participant_id = ep.id
+    WHERE ep.target_id = ? AND ep.role = ? AND q.category = ?");
+
+foreach ($targets as $t) {
+    $target_id = $t['target_id'];
+    $fio = convertToUtf8($t['fio']);
+
+    foreach ($roles as $role_key => $role_name) {
+        $row = [$fio, $role_name];
+        
+        foreach ($categories as $cat) {
+            $avg_stmt->execute([$target_id, $role_key, $cat]);
+            $avg = $avg_stmt->fetchColumn();
+            $row[] = $avg !== null ? round($avg, 2) : '-';
+        }
+        
+        fputcsv($output, $row);
+    }
+}
+
+fputcsv($output, []);
+
+fclose($output);
+exit;

@@ -1,12 +1,16 @@
 <?php
-// export_competency_breakdown_detailed.php
+// export_competency_breakdown_detailed.php (без потери 5-го вопроса)
+// Считает СТРОГО по combination_questions. Fallback по категории включается опционально: ?fallback=1
+
 require 'config.php';
 
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 
-// кол-во знаков после запятой в выводе (по умолчанию 2)
+// кол-во знаков после запятой (по умолчанию 2)
 $decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
+// включить fallback по category (не рекомендуется): ?fallback=1
+$useFallback = isset($_GET['fallback']) && (int)$_GET['fallback'] === 1;
 
 // --- Процедура
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
@@ -15,7 +19,7 @@ $procedure = $st->fetch();
 if (!$procedure) exit('Процедура не найдена');
 $year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
 
-// --- Компетенции (комбинации), привязанные к процедуре
+// --- Компетенции, привязанные к процедуре
 $st = $pdo->prepare("
   SELECT c.id, c.name
   FROM procedure_combinations pc
@@ -43,7 +47,7 @@ $st->execute([$procedureId]);
 $targets = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$targets) exit('В процедуре нет участников.');
 
-// --- Нормализация строк
+// --- Нормализация строк (для fallback)
 $normalize = function(?string $s): string {
     if ($s === null) return '';
     $s = mb_strtolower($s, 'UTF-8');
@@ -52,67 +56,68 @@ $normalize = function(?string $s): string {
     return $s;
 };
 
-// --- Карта «компетенция -> список вопросов»
+// --- Карта «компетенция -> список вопросов» (только combination_questions)
 $map = []; $hasLink = [];
 foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
 
 if ($combIds) {
     $in = implode(',', array_fill(0, count($combIds), '?'));
-    $q  = $pdo->prepare("SELECT combination_id, question_id FROM combination_questions WHERE combination_id IN ($in)");
+    $q  = $pdo->prepare("
+        SELECT combination_id, question_id 
+        FROM combination_questions 
+        WHERE combination_id IN ($in)
+        ORDER BY combination_id, question_id
+    ");
     $q->execute($combIds);
     foreach ($q as $row) {
-        $map[(int)$row['combination_id']][] = (int)$row['question_id'];
-        $hasLink[(int)$row['combination_id']] = true;
+        $cid = (int)$row['combination_id'];
+        $map[$cid][] = (int)$row['question_id'];
+        $hasLink[$cid] = true;
     }
 }
 
-// --- Fallback: если у компетенции нет явной привязки вопросов, подхватываем по category
-$needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
-if ($needFallback) {
-    $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
-
-    $groupCat = [];
-    foreach ($allQ as $row) {
-        $k = $normalize($row['category']);
-        $groupCat[$k][] = (int)$row['id'];
-    }
-
-    $synRaw = [
-        'ответственность' => 'ответственность за результат',
-        'профессиональные знания замещаемой должности' => 'профессиональные знания ключевой должности',
-        'профессиональные знания должностей, смежных к текущей' => 'профессиональные знания должностей, смежных к текущей должности',
-    ];
-    $syn = [];
-    foreach ($synRaw as $k=>$v) { $syn[$normalize($k)] = $normalize($v); }
-
-    foreach ($needFallback as $cid) {
-        $combNorm = $normalize($combNames[$cid]);
-
-        $qids = $groupCat[$combNorm] ?? null;
-
-        if (!$qids && isset($syn[$combNorm])) {
-            $alias = $syn[$combNorm];
-            $qids = $groupCat[$alias] ?? null;
+// --- Опциональный fallback по категории (если очень нужно)
+if ($useFallback) {
+    $needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
+    if ($needFallback) {
+        $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
+        $groupCat = [];
+        foreach ($allQ as $row) {
+            $k = $normalize($row['category']);
+            $groupCat[$k][] = (int)$row['id'];
         }
+        $synRaw = [
+            'ответственность' => 'ответственность за результат',
+            'профессиональные знания замещаемой должности' => 'профессиональные знания ключевой должности',
+            'профессиональные знания должностей, смежных к текущей' => 'профессиональные знания должностей, смежных к текущей должности',
+        ];
+        $syn = [];
+        foreach ($synRaw as $k=>$v) { $syn[$normalize($k)] = $normalize($v); }
 
-        if (!$qids) {
-            // простое "похожесть"-сопоставление без str_contains (совместимо со старыми PHP)
-            $bestKey = null; $bestScore = -1;
-            foreach ($groupCat as $k => $ids) {
-                $score = -1;
-                if (mb_strpos($k, $combNorm) !== false || mb_strpos($combNorm, $k) !== false) {
-                    $score = max(mb_strlen($k,'UTF-8'), mb_strlen($combNorm,'UTF-8'));
-                }
-                if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
+        foreach ($needFallback as $cid) {
+            $combNorm = $normalize($combNames[$cid]);
+            $qids = $groupCat[$combNorm] ?? null;
+            if (!$qids && isset($syn[$combNorm])) {
+                $alias = $syn[$combNorm];
+                $qids = $groupCat[$alias] ?? null;
             }
-            if ($bestKey !== null && $bestScore >= 0) $qids = $groupCat[$bestKey];
+            if (!$qids) {
+                $bestKey = null; $bestScore = -1;
+                foreach ($groupCat as $k => $ids) {
+                    $score = -1;
+                    if (mb_strpos($k, $combNorm) !== false || mb_strpos($combNorm, $k) !== false) {
+                        $score = max(mb_strlen($k,'UTF-8'), mb_strlen($combNorm,'UTF-8'));
+                    }
+                    if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
+                }
+                if ($bestKey !== null && $bestScore >= 0) $qids = $groupCat[$bestKey];
+            }
+            $map[$cid] = $qids ?: [];
         }
-
-        $map[$cid] = $qids ?: [];
     }
 }
 
-// --- Роли и веса (как в исходнике: 33.4/33.3/33.3)
+// --- Роли и веса
 $roles        = ['manager','colleague','subordinate'];
 $roleLabels   = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
 $roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
@@ -121,6 +126,7 @@ $roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
 $results  = []; // $results[fio][cid] = ['M'=>avg,'C'=>avg,'S'=>avg,'W'=>weighted]
 $details  = []; // $details[fio][cid] = [ ['fio'=>..., 'role'=>..., 'avg'=>...], ... ]
 $counts   = []; // $counts[fio][cid] = ['M'=>n, 'C'=>n, 'S'=>n]
+$qCount   = []; // $qCount[cid] = кол-во вопросов у компетенции
 
 foreach ($targets as $t) {
     $fio = $t['fio']; $tid = (int)$t['target_id'];
@@ -129,7 +135,9 @@ foreach ($targets as $t) {
     $counts[$fio]  = [];
 
     foreach ($combIds as $cid) {
-        $qids = $map[$cid] ?? [];
+        $qids = array_values(array_unique($map[$cid] ?? [])); // на всякий случай DISTINCT
+        $qCount[$cid] = count($qids);
+
         if (!$qids) {
             $results[$fio][$cid] = ['M'=>null,'C'=>null,'S'=>null,'W'=>null];
             $details[$fio][$cid] = [];
@@ -139,7 +147,7 @@ foreach ($targets as $t) {
 
         $ph = implode(',', array_fill(0, count($qids), '?'));
 
-        // 1) Средние по ролям (как и прежде)
+        // 1) Средние по ролям (берём ВСЕ ответы по ВСЕМ вопросам компетенции)
         $sqlAvg = "
           SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score,
                  COUNT(CASE WHEN a.score >= 0 THEN 1 END) AS n
@@ -181,8 +189,7 @@ foreach ($targets as $t) {
             'S' => $cntByRole['subordinate'],
         ];
 
-        // 2) Детализация: кто именно и сколько поставил (средний балл оценщика по компетенции)
-        //    усредняем по всем вопросам компетенции для конкретного оценщика
+        // 2) Детализация: средний оценщика по компетенции (по всем её вопросам)
         $sqlDet = "
           SELECT ep.evaluator_id, u.fio AS evaluator_fio, ep.role,
                  AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
@@ -219,6 +226,7 @@ th{font-weight:bold;text-align:center}
 td{vertical-align:top}
 .small{font-size:11px}
 .det th, .det td{border:1px solid #999;padding:3px}
+.warn{color:#b00;font-weight:bold}
 ";
 
 // --- Ответ как XLS
@@ -246,8 +254,12 @@ echo "\xEF\xBB\xBF";
 
   <tr>
     <th rowspan="2">Сотрудник</th>
-    <?php foreach ($competencies as $c): ?>
-      <th colspan="4"><?= htmlspecialchars($c['name']) ?></th>
+    <?php foreach ($competencies as $c):
+        $cid = (int)$c['id'];
+        $qn  = (int)($qCount[$cid] ?? 0);
+        $title = htmlspecialchars($c['name']).' (вопросов: '.$qn.')';
+    ?>
+      <th colspan="4"><?= $title ?><?= $qn===0 ? ' <span class="warn">— нет привязанных вопросов!</span>' : '' ?></th>
     <?php endforeach; ?>
   </tr>
   <tr>
@@ -278,13 +290,12 @@ echo "\xEF\xBB\xBF";
             $rows = $details[$fio][$cid] ?? [];
             $cnts = $counts[$fio][$cid] ?? ['M'=>0,'C'=>0,'S'=>0];
 
-            // мини-таблица: ФИО | Роль | Средний по компетенции
             ob_start(); ?>
             <table class="det" cellspacing="0" cellpadding="2" style="width:100%; border-collapse:collapse;">
               <tr>
                 <th>ФИО</th>
                 <th>Роль</th>
-                <th>Средний балл</th>
+                <th>Средний балл по компетенции</th>
               </tr>
               <?php if (!$rows): ?>
                 <tr><td colspan="3" class="txt">Нет данных</td></tr>
@@ -298,8 +309,7 @@ echo "\xEF\xBB\xBF";
                 <?php endforeach; ?>
                 <tr>
                   <td colspan="3" class="small">
-                    Всего оценок (по ответам): 
-                    M: <?= (int)$cnts['M'] ?> &nbsp; C: <?= (int)$cnts['C'] ?> &nbsp; S: <?= (int)$cnts['S'] ?>
+                    Всего ответов: M <?= (int)$cnts['M'] ?>; C <?= (int)$cnts['C'] ?>; S <?= (int)$cnts['S'] ?>
                   </td>
                 </tr>
               <?php endif; ?>

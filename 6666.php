@@ -55,18 +55,16 @@ if ($combs) {
 if (!$combQuestions) exit('У привязанных компетенций нет вопросов.');
 
 $roles = ['manager','colleague','subordinate','self'];
-$baseWeights = ['manager'=>0.334,'colleague'=>0.333,'subordinate'=>0.333];
 
-function avgByQuery(PDO $pdo, int $targetId, array $qids, array $rolesFilter): array {
+function fetchPerQuestionByRole(PDO $pdo, int $targetId, array $qids): array {
   if (!$qids) return [];
   $ph = implode(',', array_fill(0, count($qids), '?'));
-  $inRoles = "'".implode("','",$rolesFilter)."'";
   $sql = "
     SELECT a.question_id, ep.role, AVG(CASE WHEN a.score>=0 THEN a.score END) AS avg_score
     FROM answers a
     JOIN evaluation_participants ep ON ep.id=a.participant_id
     WHERE ep.target_id = ?
-      AND ep.role IN ($inRoles)
+      AND ep.role IN ('manager','colleague','subordinate','self')
       AND a.question_id IN ($ph)
     GROUP BY a.question_id, ep.role
   ";
@@ -81,7 +79,7 @@ function avgByQuery(PDO $pdo, int $targetId, array $qids, array $rolesFilter): a
   return $out;
 }
 
-$results = []; // [fio]['byComb'][cid] => ['m_itog'=>..., 'm_perq'=>[qid=>...], 'k_itog'=>..., 'p_itog'=>..., 's_itog'=>...]
+$results = []; // [fio]['byComb'][cid] => ['R'=>['itog'=>..,'perq'=>[qid=>..]], 'K'=>..., 'P'=>..., 'S'=>...]
 foreach ($targets as $t) {
   $tid = (int)$t['target_id'];
   $fio = $t['fio'];
@@ -92,36 +90,30 @@ foreach ($targets as $t) {
     $qs = $combQuestions[$cid] ?? [];
     $qids = array_map(fn($r)=>(int)$r['id'],$qs);
 
-    $mgrPerQ = avgByQuery($pdo, $tid, $qids, ['manager']);
-    $m_perq = [];
-    foreach ($qids as $qid) { $m_perq[$qid] = $mgrPerQ[$qid]['manager'] ?? null; }
+    $perQ = fetchPerQuestionByRole($pdo, $tid, $qids);
 
-    $byRole = avgByQuery($pdo, $tid, $qids, ['manager','colleague','subordinate','self']);
-    $acc = ['manager'=>[],'colleague'=>[],'subordinate'=>[],'self'=>[]];
-    foreach ($qids as $qid) {
-      foreach (['manager','colleague','subordinate','self'] as $rl) {
-        if (isset($byRole[$qid][$rl]) && $byRole[$qid][$rl] !== null) $acc[$rl][] = (float)$byRole[$qid][$rl];
+    $packs = ['R'=>'manager','K'=>'colleague','P'=>'subordinate','S'=>'self'];
+    $block = [];
+    foreach ($packs as $label=>$rl) {
+      $perq = [];
+      $acc = [];
+      foreach ($qids as $qid) {
+        $v = $perQ[$qid][$rl] ?? null;
+        $perq[$qid] = $v;
+        if ($v !== null) $acc[] = $v;
       }
+      $itog = $acc ? array_sum($acc)/count($acc) : null;
+      $block[$label] = ['itog'=>$itog,'perq'=>$perq];
     }
-    $m_itog = $acc['manager']     ? array_sum($acc['manager'])/count($acc['manager'])         : null;
-    $k_itog = $acc['colleague']   ? array_sum($acc['colleague'])/count($acc['colleague'])     : null;
-    $p_itog = $acc['subordinate'] ? array_sum($acc['subordinate'])/count($acc['subordinate']) : null;
-    $s_itog = $acc['self']        ? array_sum($acc['self'])/count($acc['self'])               : null;
 
-    $results[$fio]['byComb'][$cid] = [
-      'm_itog'=>$m_itog,
-      'm_perq'=>$m_perq,
-      'k_itog'=>$k_itog,
-      'p_itog'=>$p_itog,
-      's_itog'=>$s_itog
-    ];
+    $results[$fio]['byComb'][$cid] = $block;
   }
 }
 
 $fmt = ($decimals > 0) ? "0." . str_repeat('0',$decimals) : "0";
-$css = ".n{mso-number-format:'$fmt';text-align:center}.t{text-align:center}th{font-weight:bold;text-align:center}td{vertical-align:middle}.b{background:#e9f1f7}";
+$css = ".n{mso-number-format:'$fmt';text-align:center}.t{text-align:center}th{font-weight:bold;text-align:center}td{vertical-align:middle}.b{background:#e9f1f7}.g{background:#f7f7f7}";
 
-$fname = 'report_questions_by_role_blocks_'.$procedureId.'.xls';
+$fname = 'report_questions_roles_full_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
 header('Content-Disposition: attachment; filename="'.$fname.'"');
 echo "\xEF\xBB\xBF";
@@ -141,25 +133,44 @@ echo "\xEF\xBB\xBF";
       foreach ($combs as $c) {
         $cid = (int)$c['id'];
         $qs  = $combQuestions[$cid] ?? [];
-        $colspan += 1 + count($qs) + 3; // Р. Итог + R1..Rn + К Итог + П Итог + С Итог
+        $n = count($qs);
+        $colspan += 4 * (1 + $n); // Р блок + К блок + П блок + С блок
       }
     ?>
     <th colspan="<?= $colspan ?>"><?= htmlspecialchars($procedure['title']) ?> — <?= $year ?> г.</th>
   </tr>
+
   <tr>
     <th class="b">Оцениваемый</th>
-    <?php foreach ($combs as $c): $cid=(int)$c['id']; $qs=$combQuestions[$cid]??[]; ?>
-      <th class="b" colspan="<?= 1 + count($qs) + 3 ?>"><?= htmlspecialchars($c['name']) ?></th>
+    <?php foreach ($combs as $c): $cid=(int)$c['id']; $qs=$combQuestions[$cid]??[]; $n=count($qs); ?>
+      <th class="b" colspan="<?= 4*(1+$n) ?>"><?= htmlspecialchars($c['name']) ?></th>
     <?php endforeach; ?>
   </tr>
+
   <tr>
     <th class="t">ФИО</th>
+    <?php foreach ($combs as $c): $cid=(int)$c['id']; $qs=$combQuestions[$cid]??[]; $n=count($qs); ?>
+      <th class="g" colspan="<?= 1+$n ?>">Р</th>
+      <th class="g" colspan="<?= 1+$n ?>">К</th>
+      <th class="g" colspan="<?= 1+$n ?>">П</th>
+      <th class="g" colspan="<?= 1+$n ?>">С</th>
+    <?php endforeach; ?>
+  </tr>
+
+  <tr>
+    <th class="t"></th>
     <?php foreach ($combs as $c): $cid=(int)$c['id']; $qs=$combQuestions[$cid]??[]; $i=1; ?>
       <th>Р. Итог</th>
-      <?php foreach ($qs as $_): ?><th>R<?= $i++ ?></th><?php endforeach; ?>
+      <?php foreach ($qs as $_): ?><th>Р<?= $i++ ?></th><?php endforeach; ?>
+      <?php $i=1; ?>
       <th>К. Итог</th>
+      <?php foreach ($qs as $_): ?><th>К<?= $i++ ?></th><?php endforeach; ?>
+      <?php $i=1; ?>
       <th>П. Итог</th>
+      <?php foreach ($qs as $_): ?><th>П<?= $i++ ?></th><?php endforeach; ?>
+      <?php $i=1; ?>
       <th>С. Итог</th>
+      <?php foreach ($qs as $_): ?><th>С<?= $i++ ?></th><?php endforeach; ?>
     <?php endforeach; ?>
   </tr>
 
@@ -167,21 +178,23 @@ echo "\xEF\xBB\xBF";
     <tr>
       <td class="t"><?= htmlspecialchars($fio) ?></td>
       <?php foreach ($combs as $c):
-        $cid=(int)$c['id']; $qs=$combQuestions[$cid]??[];
-        $v = $by['byComb'][$cid] ?? null;
-        $m_itog = $v['m_itog'] ?? null;
-        $k_itog = $v['k_itog'] ?? null;
-        $p_itog = $v['p_itog'] ?? null;
-        $s_itog = $v['s_itog'] ?? null;
+        $cid=(int)$c['id']; $qs=$combQuestions[$cid]??[]; $block=$by['byComb'][$cid]??null;
 
-        echo ($m_itog===null)?'<td class="t">-</td>':'<td class="n">'.number_format($m_itog,$decimals,'.','').'</td>';
-        foreach ($qs as $q) {
-          $qid=(int)$q['id']; $mv = $v['m_perq'][$qid] ?? null;
-          echo ($mv===null)?'<td class="t">-</td>':'<td class="n">'.number_format($mv,$decimals,'.','').'</td>';
-        }
-        echo ($k_itog===null)?'<td class="t">-</td>':'<td class="n">'.number_format($k_itog,$decimals,'.','').'</td>';
-        echo ($p_itog===null)?'<td class="t">-</td>':'<td class="n">'.number_format($p_itog,$decimals,'.','').'</td>';
-        echo ($s_itog===null)?'<td class="t">-</td>':'<td class="n">'.number_format($s_itog,$decimals,'.','').'</td>';
+        $R=$block['R']??['itog'=>null,'perq'=>[]];
+        echo ($R['itog']===null)?'<td class="t">-</td>':'<td class="n">'.number_format($R['itog'],$decimals,'.','').'</td>';
+        foreach ($qs as $q){ $v=$R['perq'][(int)$q['id']]??null; echo ($v===null)?'<td class="t">-</td>':'<td class="n">'.number_format($v,$decimals,'.','').'</td>'; }
+
+        $K=$block['K']??['itog'=>null,'perq'=>[]];
+        echo ($K['itog']===null)?'<td class="t">-</td>':'<td class="n">'.number_format($K['itog'],$decimals,'.','').'</td>';
+        foreach ($qs as $q){ $v=$K['perq'][(int)$q['id']]??null; echo ($v===null)?'<td class="t">-</td>':'<td class="n">'.number_format($v,$decimals,'.','').'</td>'; }
+
+        $P=$block['P']??['itog'=>null,'perq'=>[]];
+        echo ($P['itog']===null)?'<td class="t">-</td>':'<td class="n">'.number_format($P['itog'],$decimals,'.','').'</td>';
+        foreach ($qs as $q){ $v=$P['perq'][(int)$q['id']]??null; echo ($v===null)?'<td class="t">-</td>':'<td class="n">'.number_format($v,$decimals,'.','').'</td>'; }
+
+        $S=$block['S']??['itog'=>null,'perq'=>[]];
+        echo ($S['itog']===null)?'<td class="t">-</td>':'<td class="n">'.number_format($S['itog'],$decimals,'.','').'</td>';
+        foreach ($qs as $q){ $v=$S['perq'][(int)$q['id']]??null; echo ($v===null)?'<td class="t">-</td>':'<td class="n">'.number_format($v,$decimals,'.','').'</td>'; }
       endforeach; ?>
     </tr>
   <?php endforeach; ?>

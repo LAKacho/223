@@ -1,152 +1,315 @@
 <?php
-// export_group_answers_csv.php
-// CSV-выгрузка всех ответов по процедуре: на кого, кто, роль, вопрос, балл.
-
+// export_competency_breakdown_detailed.php
 require 'config.php';
 
-// --- Вход
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
-if ($procedureId <= 0) {
-    http_response_code(400);
-    exit('Нужно передать ?procedure_id=');
-}
+if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 
-// Разделитель для CSV (в русской локали Excel чаще ожидает ;)
-$sep = isset($_GET['sep']) ? $_GET['sep'] : ';';
-
-// Включать ли самооценку (self)? по умолчанию да (1). Передайте include_self=0 чтобы исключить.
-$includeSelf = isset($_GET['include_self']) ? (int)$_GET['include_self'] : 1;
+// кол-во знаков после запятой в выводе (по умолчанию 2)
+$decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
 
 // --- Процедура
-$st = $pdo->prepare("SELECT id, title FROM evaluation_procedures WHERE id = ?");
+$st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
 $st->execute([$procedureId]);
 $procedure = $st->fetch();
-if (!$procedure) {
-    exit('Процедура не найдена');
+if (!$procedure) exit('Процедура не найдена');
+$year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
+
+// --- Компетенции (комбинации), привязанные к процедуре
+$st = $pdo->prepare("
+  SELECT c.id, c.name
+  FROM procedure_combinations pc
+  JOIN combinations c ON c.id = pc.combination_id
+  WHERE pc.procedure_id = ?
+  ORDER BY c.name
+");
+$st->execute([$procedureId]);
+$competencies = $st->fetchAll(PDO::FETCH_ASSOC);
+if (!$competencies) exit('К процедуре не привязаны компетенции.');
+
+$combIds   = array_map(function($r){ return (int)$r['id']; }, $competencies);
+$combNames = [];
+foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
+
+// --- Оцениваемые (таргеты)
+$st = $pdo->prepare("
+  SELECT et.id AS target_id, u.fio
+  FROM evaluation_targets et
+  JOIN users u ON u.id = et.user_id
+  WHERE et.procedure_id = ?
+  ORDER BY u.fio
+");
+$st->execute([$procedureId]);
+$targets = $st->fetchAll(PDO::FETCH_ASSOC);
+if (!$targets) exit('В процедуре нет участников.');
+
+// --- Нормализация строк
+$normalize = function(?string $s): string {
+    if ($s === null) return '';
+    $s = mb_strtolower($s, 'UTF-8');
+    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);
+    $s = preg_replace('/\s+/u', ' ', trim($s));
+    return $s;
+};
+
+// --- Карта «компетенция -> список вопросов»
+$map = []; $hasLink = [];
+foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
+
+if ($combIds) {
+    $in = implode(',', array_fill(0, count($combIds), '?'));
+    $q  = $pdo->prepare("SELECT combination_id, question_id FROM combination_questions WHERE combination_id IN ($in)");
+    $q->execute($combIds);
+    foreach ($q as $row) {
+        $map[(int)$row['combination_id']][] = (int)$row['question_id'];
+        $hasLink[(int)$row['combination_id']] = true;
+    }
 }
 
-// --- Роль -> русская подпись
-$roleLabel = array(
-    'manager'      => 'Руководитель',
-    'colleague'    => 'Коллега',
-    'subordinate'  => 'Подчинённый',
-    'self'         => 'Самооценка',
-);
+// --- Fallback: если у компетенции нет явной привязки вопросов, подхватываем по category
+$needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
+if ($needFallback) {
+    $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
 
-// --- SQL всех ответов по процедуре
-// a.score может быть -1 (нет наблюдений) — в CSV отдадим пусто.
-$sql = "
-    SELECT
-        ut.fio  AS target_fio,      -- кого оценивают
-        ue.fio  AS evaluator_fio,   -- кто оценивает
-        ep.role AS role_code,       -- роль
-        q.text  AS question_text,   -- текст вопроса
-        a.score AS score,           -- балл
-        a.created_at AS answered_at -- если есть поле времени
-    FROM answers a
-    JOIN evaluation_participants ep ON ep.id = a.participant_id
-    JOIN evaluation_targets et       ON et.id = ep.target_id
-    JOIN users ut                    ON ut.id = et.user_id
-    JOIN users ue                    ON ue.id = ep.evaluator_id
-    JOIN questions q                 ON q.id = a.question_id
-    WHERE et.procedure_id = ?
-";
-$params = array($procedureId);
+    $groupCat = [];
+    foreach ($allQ as $row) {
+        $k = $normalize($row['category']);
+        $groupCat[$k][] = (int)$row['id'];
+    }
 
-if (!$includeSelf) {
-    $sql .= " AND ep.role <> 'self' ";
-}
+    $synRaw = [
+        'ответственность' => 'ответственность за результат',
+        'профессиональные знания замещаемой должности' => 'профессиональные знания ключевой должности',
+        'профессиональные знания должностей, смежных к текущей' => 'профессиональные знания должностей, смежных к текущей должности',
+    ];
+    $syn = [];
+    foreach ($synRaw as $k=>$v) { $syn[$normalize($k)] = $normalize($v); }
 
-$sql .= " ORDER BY ut.fio, ep.role, ue.fio, q.id";
+    foreach ($needFallback as $cid) {
+        $combNorm = $normalize($combNames[$cid]);
 
-$stmt = $pdo->prepare($sql);
-$stmt->execute($params);
+        $qids = $groupCat[$combNorm] ?? null;
 
-// --- Заголовки для отдачи файла
-$fname = 'group_answers_'.$procedureId.'.csv';
-header('Content-Type: text/csv; charset=UTF-8');
-header('Content-Disposition: attachment; filename="'.$fname.'"');
-
-// Вставляем BOM, чтобы Excel корректно открыл кириллицу
-echo "\xEF\xBB\xBF";
-
-// Пишем CSV построчно (через fputcsv в поток вывода)
-$fp = fopen('php://output', 'w');
-
-// Настроим fputcsv под выбранный разделитель
-if (!function_exists('fputcsv_custom')) {
-    function fputcsv_custom($fp, $fields, $sep = ';', $enclosure = '"', $escape = '\\') {
-        // Универсальный fputcsv (под старые PHP, если нужно задать кастомный разделитель)
-        $line = '';
-        $first = true;
-        foreach ($fields as $field) {
-            if (!$first) {
-                $line .= $sep;
-            }
-            $first = false;
-
-            // Приведём к строке
-            if (is_null($field)) {
-                $field = '';
-            } elseif (is_bool($field)) {
-                $field = $field ? '1' : '0';
-            } elseif (!is_string($field)) {
-                $field = (string)$field;
-            }
-
-            // Экранирование
-            $needQuotes = (strpos($field, $sep) !== false) ||
-                          (strpos($field, "\n") !== false) ||
-                          (strpos($field, "\r") !== false) ||
-                          (strpos($field, $enclosure) !== false);
-
-            $field = str_replace($enclosure, $enclosure.$enclosure, $field);
-            if ($needQuotes) {
-                $field = $enclosure.$field.$enclosure;
-            }
-            $line .= $field;
+        if (!$qids && isset($syn[$combNorm])) {
+            $alias = $syn[$combNorm];
+            $qids = $groupCat[$alias] ?? null;
         }
-        $line .= "\r\n";
-        fwrite($fp, $line);
+
+        if (!$qids) {
+            // простое "похожесть"-сопоставление без str_contains (совместимо со старыми PHP)
+            $bestKey = null; $bestScore = -1;
+            foreach ($groupCat as $k => $ids) {
+                $score = -1;
+                if (mb_strpos($k, $combNorm) !== false || mb_strpos($combNorm, $k) !== false) {
+                    $score = max(mb_strlen($k,'UTF-8'), mb_strlen($combNorm,'UTF-8'));
+                }
+                if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
+            }
+            if ($bestKey !== null && $bestScore >= 0) $qids = $groupCat[$bestKey];
+        }
+
+        $map[$cid] = $qids ?: [];
     }
 }
 
-// Шапка CSV
-fputcsv_custom($fp, array(
-    'Процедура',
-    'Кого оценивали (ФИО)',
-    'Кто оценивал (ФИО)',
-    'Роль',
-    'Вопрос',
-    'Балл',
-    'Когда ответили'
-), $sep);
+// --- Роли и веса (как в исходнике: 33.4/33.3/33.3)
+$roles        = ['manager','colleague','subordinate'];
+$roleLabels   = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
+$roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
 
-// Данные
-while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-    $role  = isset($roleLabel[$row['role_code']]) ? $roleLabel[$row['role_code']] : $row['role_code'];
+// --- Основная матрица средних + детализация по оценщикам
+$results  = []; // $results[fio][cid] = ['M'=>avg,'C'=>avg,'S'=>avg,'W'=>weighted]
+$details  = []; // $details[fio][cid] = [ ['fio'=>..., 'role'=>..., 'avg'=>...], ... ]
+$counts   = []; // $counts[fio][cid] = ['M'=>n, 'C'=>n, 'S'=>n]
 
-    // Преобразуем балл: -1 -> пусто (н/д)
-    $score = $row['score'];
-    if ($score === null) {
-        $scoreOut = '';
-    } else {
-        $score = (float)$score;
-        $scoreOut = ($score < 0) ? '' : (string)$score;
+foreach ($targets as $t) {
+    $fio = $t['fio']; $tid = (int)$t['target_id'];
+    $results[$fio] = [];
+    $details[$fio] = [];
+    $counts[$fio]  = [];
+
+    foreach ($combIds as $cid) {
+        $qids = $map[$cid] ?? [];
+        if (!$qids) {
+            $results[$fio][$cid] = ['M'=>null,'C'=>null,'S'=>null,'W'=>null];
+            $details[$fio][$cid] = [];
+            $counts[$fio][$cid]  = ['M'=>0,'C'=>0,'S'=>0];
+            continue;
+        }
+
+        $ph = implode(',', array_fill(0, count($qids), '?'));
+
+        // 1) Средние по ролям (как и прежде)
+        $sqlAvg = "
+          SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score,
+                 COUNT(CASE WHEN a.score >= 0 THEN 1 END) AS n
+          FROM answers a
+          JOIN evaluation_participants ep ON ep.id = a.participant_id
+          WHERE ep.target_id = ?
+            AND ep.role IN ('manager','colleague','subordinate')
+            AND a.question_id IN ($ph)
+          GROUP BY ep.role
+        ";
+        $stmt = $pdo->prepare($sqlAvg);
+        $stmt->execute(array_merge([$tid], $qids));
+
+        $avgByRole = ['manager'=>null,'colleague'=>null,'subordinate'=>null];
+        $cntByRole = ['manager'=>0,'colleague'=>0,'subordinate'=>0];
+        foreach ($stmt as $r) {
+            if ($r['avg_score'] !== null) $avgByRole[$r['role']] = (float)$r['avg_score'];
+            $cntByRole[$r['role']] = (int)$r['n'];
+        }
+
+        $sumW = 0; $sumV = 0;
+        foreach ($roles as $rl) {
+            if ($avgByRole[$rl] !== null) {
+                $sumW += $roleWeights[$rl];
+                $sumV += $roleWeights[$rl] * $avgByRole[$rl];
+            }
+        }
+        $weighted = ($sumW > 0) ? ($sumV / $sumW) : null;
+
+        $results[$fio][$cid] = [
+            'M' => $avgByRole['manager'],
+            'C' => $avgByRole['colleague'],
+            'S' => $avgByRole['subordinate'],
+            'W' => $weighted,
+        ];
+        $counts[$fio][$cid] = [
+            'M' => $cntByRole['manager'],
+            'C' => $cntByRole['colleague'],
+            'S' => $cntByRole['subordinate'],
+        ];
+
+        // 2) Детализация: кто именно и сколько поставил (средний балл оценщика по компетенции)
+        //    усредняем по всем вопросам компетенции для конкретного оценщика
+        $sqlDet = "
+          SELECT ep.evaluator_id, u.fio AS evaluator_fio, ep.role,
+                 AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
+          FROM answers a
+          JOIN evaluation_participants ep ON ep.id = a.participant_id
+          JOIN users u ON u.id = ep.evaluator_id
+          WHERE ep.target_id = ?
+            AND ep.role IN ('manager','colleague','subordinate')
+            AND a.question_id IN ($ph)
+          GROUP BY ep.evaluator_id, u.fio, ep.role
+          ORDER BY ep.role, u.fio
+        ";
+        $stmt2 = $pdo->prepare($sqlDet);
+        $stmt2->execute(array_merge([$tid], $qids));
+
+        $rows = [];
+        foreach ($stmt2 as $r2) {
+            $rows[] = [
+                'fio'  => $r2['evaluator_fio'],
+                'role' => $r2['role'],
+                'avg'  => ($r2['avg_score'] !== null) ? (float)$r2['avg_score'] : null,
+            ];
+        }
+        $details[$fio][$cid] = $rows;
     }
-
-    $when = isset($row['answered_at']) ? $row['answered_at'] : '';
-
-    fputcsv_custom($fp, array(
-        $procedure['title'],
-        $row['target_fio'],
-        $row['evaluator_fio'],
-        $role,
-        $row['question_text'],
-        $scoreOut,
-        $when
-    ), $sep);
 }
 
-fclose($fp);
-exit;
+// --- CSS для Excel-совместимого HTML
+$fmt = ($decimals > 0) ? ('0.'.str_repeat('0', $decimals)) : '0';
+$css = "
+.num{mso-number-format:'{$fmt}';text-align:center}
+.txt{text-align:center}
+th{font-weight:bold;text-align:center}
+td{vertical-align:top}
+.small{font-size:11px}
+.det th, .det td{border:1px solid #999;padding:3px}
+";
+
+// --- Ответ как XLS
+$fname = 'competency_breakdown_detailed_'.$procedureId.'.xls';
+header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
+header('Content-Disposition: attachment; filename="'.$fname.'"');
+echo "\xEF\xBB\xBF";
+?>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title><?= htmlspecialchars($procedure['title']) ?></title>
+<style><?= $css ?></style>
+</head>
+<body>
+
+<table border="1" cellspacing="0" cellpadding="4">
+  <tr>
+    <th colspan="<?= 1 + count($competencies)*4 ?>">Детализация оценки по компетенциям (M/C/S + взвешенный итог) с ФИО оценщиков</th>
+  </tr>
+  <tr>
+    <th colspan="<?= 1 + count($competencies)*4 ?>"><?= htmlspecialchars($procedure['title']) ?> — <?= $year ?> г.</th>
+  </tr>
+
+  <tr>
+    <th rowspan="2">Сотрудник</th>
+    <?php foreach ($competencies as $c): ?>
+      <th colspan="4"><?= htmlspecialchars($c['name']) ?></th>
+    <?php endforeach; ?>
+  </tr>
+  <tr>
+    <?php foreach ($competencies as $c): ?>
+      <th>M</th><th>C</th><th>S</th><th>Итог</th>
+    <?php endforeach; ?>
+  </tr>
+
+  <?php foreach ($results as $fio => $byCid): ?>
+    <tr>
+      <td class="txt"><strong><?= htmlspecialchars($fio) ?></strong></td>
+      <?php foreach ($competencies as $c):
+            $cid = (int)$c['id'];
+            $row = $byCid[$cid] ?? ['M'=>null,'C'=>null,'S'=>null,'W'=>null];
+            $M = $row['M']; $C = $row['C']; $S = $row['S']; $W = $row['W']; ?>
+        <?= ($M === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($M, $decimals, '.', '').'</td>' ?>
+        <?= ($C === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($C, $decimals, '.', '').'</td>' ?>
+        <?= ($S === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($S, $decimals, '.', '').'</td>' ?>
+        <?= ($W === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($W, $decimals, '.', '').'</td>' ?>
+      <?php endforeach; ?>
+    </tr>
+
+    <!-- строка-детализация: кто как оценил по каждой компетенции -->
+    <tr>
+      <td class="small" style="background:#f8f9fa;">Детализация оценщиков</td>
+      <?php foreach ($competencies as $c):
+            $cid = (int)$c['id'];
+            $rows = $details[$fio][$cid] ?? [];
+            $cnts = $counts[$fio][$cid] ?? ['M'=>0,'C'=>0,'S'=>0];
+
+            // мини-таблица: ФИО | Роль | Средний по компетенции
+            ob_start(); ?>
+            <table class="det" cellspacing="0" cellpadding="2" style="width:100%; border-collapse:collapse;">
+              <tr>
+                <th>ФИО</th>
+                <th>Роль</th>
+                <th>Средний балл</th>
+              </tr>
+              <?php if (!$rows): ?>
+                <tr><td colspan="3" class="txt">Нет данных</td></tr>
+              <?php else: ?>
+                <?php foreach ($rows as $rr): ?>
+                  <tr>
+                    <td><?= htmlspecialchars($rr['fio']) ?></td>
+                    <td class="txt"><?= htmlspecialchars($roleLabels[$rr['role']] ?? $rr['role']) ?></td>
+                    <td class="num"><?= ($rr['avg']===null?'':number_format($rr['avg'], $decimals, '.', '')) ?></td>
+                  </tr>
+                <?php endforeach; ?>
+                <tr>
+                  <td colspan="3" class="small">
+                    Всего оценок (по ответам): 
+                    M: <?= (int)$cnts['M'] ?> &nbsp; C: <?= (int)$cnts['C'] ?> &nbsp; S: <?= (int)$cnts['S'] ?>
+                  </td>
+                </tr>
+              <?php endif; ?>
+            </table>
+            <?php $mini = ob_get_clean();
+            echo '<td colspan="4">'.$mini.'</td>'; ?>
+      <?php endforeach; ?>
+    </tr>
+  <?php endforeach; ?>
+</table>
+
+</body>
+</html>

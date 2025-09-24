@@ -6,55 +6,127 @@ if ($procedureId <= 0) { http_response_code(400); exit('Нужно переда�
 
 $decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
 
-function trunc_dec($x, int $n): float {
-    $p = pow(10, $n);
-    return ($x >= 0) ? floor($x * $p) / $p : ceil($x * $p) / $p;
-}
-function fmt_dec($x, int $n): string {
-    $v = trunc_dec((float)$x, $n);
-    return number_format($v, $n, '.', '');
-}
-
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
 $st->execute([$procedureId]);
-$procedure = $st->fetch() ?: exit('Процедура не найдена');
+$procedure = $st->fetch();
+if (!$procedure) exit('Процедура не найдена');
 $year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
 
-$sql = "
-SELECT
-  tu.fio  AS target_fio,
-  eu.fio  AS evaluator_fio,
-  ep.role AS role,
-  q.id    AS question_id,
-  q.text  AS question_text,
-  q.category AS category,
-  a.score AS score
-FROM answers a
-JOIN evaluation_participants ep ON ep.id = a.participant_id
-JOIN evaluation_targets et      ON et.id = ep.target_id
-JOIN users eu                   ON eu.id = ep.user_id
-JOIN users tu                   ON tu.id = et.user_id
-JOIN questions q                ON q.id = a.question_id
-WHERE et.procedure_id = ?
-ORDER BY tu.fio, FIELD(ep.role, 'manager','colleague','subordinate','self'), eu.fio, q.id
-";
-$st = $pdo->prepare($sql);
+$st = $pdo->prepare("
+  SELECT et.id AS target_id, u.fio
+  FROM evaluation_targets et
+  JOIN users u ON u.id = et.user_id
+  WHERE et.procedure_id = ?
+  ORDER BY u.fio
+");
 $st->execute([$procedureId]);
-$rows = $st->fetchAll(PDO::FETCH_ASSOC);
+$targets = $st->fetchAll(PDO::FETCH_ASSOC);
+if (!$targets) exit('В процедуре нет участников.');
 
-$byTarget = [];
-foreach ($rows as $r) $byTarget[$r['target_fio']][] = $r;
+$st = $pdo->prepare("
+  SELECT c.id, c.name
+  FROM procedure_combinations pc
+  JOIN combinations c ON c.id = pc.combination_id
+  WHERE pc.procedure_id = ?
+  ORDER BY c.name
+");
+$st->execute([$procedureId]);
+$combs = $st->fetchAll(PDO::FETCH_ASSOC);
+if (!$combs) exit('К процедуре не привязаны компетенции.');
 
-$fmtMask = ($decimals > 0) ? "0." . str_repeat('0', $decimals) : "0";
-$css = "
-.num{mso-number-format:'{$fmtMask}';text-align:center}
-.txt{text-align:left}
-th{font-weight:bold;text-align:center}
-.target{background:#f2f6ff;font-weight:bold}
-.sep{height:6px}
-";
+$combQuestions = [];
+$allQuestionIds = [];
+if ($combs) {
+  $in = implode(',', array_fill(0, count($combs), '?'));
+  $combIds = array_map(fn($r)=>(int)$r['id'], $combs);
 
-$fname = 'answers_detailed_'.$procedureId.'.xls';
+  $q = $pdo->prepare("SELECT qc.combination_id, qc.question_id, q.text
+                      FROM question_combination qc
+                      JOIN questions q ON q.id = qc.question_id
+                      WHERE qc.combination_id IN ($in)
+                      ORDER BY qc.combination_id, qc.question_id");
+  $q->execute($combIds);
+  foreach ($q as $row) {
+    $cid = (int)$row['combination_id'];
+    $qid = (int)$row['question_id'];
+    $combQuestions[$cid][] = ['id'=>$qid, 'text'=>$row['text']];
+    $allQuestionIds[$qid] = $row['text'];
+  }
+}
+
+if (!$combQuestions) exit('У привязанных компетенций нет вопросов.');
+
+$roles = ['manager','colleague','subordinate','self'];
+$roleLabel = ['manager'=>'Рук','colleague'=>'Колл','subordinate'=>'Подч','self'=>'Сам'];
+$baseWeights = ['manager'=>0.334,'colleague'=>0.333,'subordinate'=>0.333]; // self не учитывается
+
+$results = []; // [fio][question_id] => ['manager'=>avg,'colleague'=>avg,'subordinate'=>avg,'self'=>avg,'weighted'=>val]
+
+foreach ($targets as $t) {
+  $tid = (int)$t['target_id'];
+  $fio = $t['fio'];
+  $results[$fio] = [];
+
+  $qids = array_keys($allQuestionIds);
+  $ph = implode(',', array_fill(0, count($qids), '?'));
+
+  $sql = "
+    SELECT a.question_id,
+           ep.role,
+           AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
+    FROM answers a
+    JOIN evaluation_participants ep ON ep.id = a.participant_id
+    WHERE ep.target_id = ?
+      AND ep.role IN ('manager','colleague','subordinate','self')
+      AND a.question_id IN ($ph)
+    GROUP BY a.question_id, ep.role
+  ";
+  $stmt = $pdo->prepare($sql);
+  $stmt->execute(array_merge([$tid], $qids));
+
+  $perQ = []; // temp
+  foreach ($stmt as $r) {
+    $qid = (int)$r['question_id'];
+    $role = $r['role'];
+    $avg  = ($r['avg_score'] !== null) ? (float)$r['avg_score'] : null;
+    if (!isset($perQ[$qid])) $perQ[$qid] = ['manager'=>null,'colleague'=>null,'subordinate'=>null,'self'=>null];
+    $perQ[$qid][$role] = $avg;
+  }
+
+  foreach ($qids as $qid) {
+    $byRole = $perQ[$qid] ?? ['manager'=>null,'colleague'=>null,'subordinate'=>null,'self'=>null];
+
+    $sumW = 0.0; $sumV = 0.0;
+    $present = [];
+    foreach (['manager','colleague','subordinate'] as $rl) {
+      if ($byRole[$rl] !== null) $present[$rl] = true;
+    }
+
+    if ($present) {
+      $rawW = 0.0;
+      foreach ($present as $rl => $_) $rawW += $baseWeights[$rl];
+      foreach ($present as $rl => $_) {
+        $w = $baseWeights[$rl] / $rawW;
+        $sumW += $w;
+        $sumV += $w * $byRole[$rl];
+      }
+    }
+    $weighted = ($sumW > 0) ? $sumV : null;
+
+    $results[$fio][$qid] = [
+      'manager'     => $byRole['manager'],
+      'colleague'   => $byRole['colleague'],
+      'subordinate' => $byRole['subordinate'],
+      'self'        => $byRole['self'],
+      'weighted'    => $weighted,
+    ];
+  }
+}
+
+$fmt = ($decimals > 0) ? "0." . str_repeat('0',$decimals) : "0";
+$css = ".n{mso-number-format:'$fmt';text-align:center}.t{text-align:center}th{font-weight:bold;text-align:center}td{vertical-align:middle}";
+
+$fname = 'report_questions_by_role_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
 header('Content-Disposition: attachment; filename="'.$fname.'"');
 echo "\xEF\xBB\xBF";
@@ -67,46 +139,57 @@ echo "\xEF\xBB\xBF";
 <style><?= $css ?></style>
 </head>
 <body>
-<table border="1" cellspacing="0" cellpadding="4">
+<table border="1" cellspacing="0" cellpadding="3">
   <tr>
-    <th colspan="6">Детальный отчёт по ответам (включая самооценку) — <?= htmlspecialchars($procedure['title']) ?>, <?= $year ?> г.</th>
-  </tr>
-  <tr>
-    <th>Кого оценивали (ФИО)</th>
-    <th>Кто оценивал (ФИО)</th>
-    <th>Роль</th>
-    <th>Категория (компетенция)</th>
-    <th>Вопрос</th>
-    <th>Балл</th>
-  </tr>
-<?php if (!$rows): ?>
-  <tr><td colspan="6" class="txt">Ответов не найдено.</td></tr>
-<?php else: ?>
-  <?php foreach ($byTarget as $targetFio => $items): ?>
-    <tr class="target"><td class="txt" colspan="6"><?= htmlspecialchars($targetFio) ?></td></tr>
-    <?php foreach ($items as $r):
-          $role = $r['role'];
-          if     ($role==='manager')     $roleTitle='Руководитель';
-          elseif ($role==='colleague')   $roleTitle='Коллега';
-          elseif ($role==='subordinate') $roleTitle='Подчинённый';
-          elseif ($role==='self')        $roleTitle='Самооценка';
-          else                           $roleTitle=$role;
-          $score = $r['score'];
-          $cell = ($score === null || $score < 0) ? '<td class="num">-</td>' : '<td class="num">'.fmt_dec($score,$decimals).'</td>';
+    <?php
+      $colspan = 1;
+      foreach ($combs as $c) {
+        $cid = (int)$c['id'];
+        $qs  = $combQuestions[$cid] ?? [];
+        $colspan += count($qs) * 5; // M,C,S,Self,Итог
+      }
     ?>
-      <tr>
-        <td class="txt"><?= htmlspecialchars($targetFio) ?></td>
-        <td class="txt"><?= htmlspecialchars($r['evaluator_fio']) ?></td>
-        <td class="txt"><?= htmlspecialchars($roleTitle) ?></td>
-        <td class="txt"><?= htmlspecialchars((string)$r['category']) ?></td>
-        <td class="txt"><?= htmlspecialchars((string)$r['question_text']) ?></td>
-        <?= $cell ?>
-      </tr>
+    <th colspan="<?= $colspan ?>"><?= htmlspecialchars($procedure['title']) ?> — <?= $year ?> г.</th>
+  </tr>
+  <tr>
+    <th rowspan="2">Оцениваемый</th>
+    <?php foreach ($combs as $c): $cid = (int)$c['id']; $qs = $combQuestions[$cid] ?? []; ?>
+      <th colspan="<?= count($qs)*5 ?>"><?= htmlspecialchars($c['name']) ?></th>
     <?php endforeach; ?>
-    <tr class="sep"><td colspan="6">&nbsp;</td></tr>
+  </tr>
+  <tr>
+    <?php foreach ($combs as $c): $cid = (int)$c['id']; $qs = $combQuestions[$cid] ?? []; $i=1; ?>
+      <?php foreach ($qs as $q): ?>
+        <th>M<br><?= $i ?></th>
+        <th>C<br><?= $i ?></th>
+        <th>S<br><?= $i ?></th>
+        <th>Self<br><?= $i ?></th>
+        <th>Итог<br><?= $i++ ?></th>
+      <?php endforeach; ?>
+    <?php endforeach; ?>
+  </tr>
+
+  <?php foreach ($results as $fio => $byQ): ?>
+    <tr>
+      <td class="t"><?= htmlspecialchars($fio) ?></td>
+      <?php foreach ($combs as $c): $cid = (int)$c['id']; $qs = $combQuestions[$cid] ?? []; ?>
+        <?php foreach ($qs as $q): $qid = (int)$q['id']; $r = $byQ[$qid] ?? null; ?>
+          <?php
+            $M = $r['manager']     ?? null;
+            $C = $r['colleague']   ?? null;
+            $S = $r['subordinate'] ?? null;
+            $SELF = $r['self']     ?? null;
+            $W = $r['weighted']    ?? null;
+          ?>
+          <?= ($M===null)?'<td class="t">-</td>':'<td class="n">'.number_format($M,$decimals,'.','').'</td>' ?>
+          <?= ($C===null)?'<td class="t">-</td>':'<td class="n">'.number_format($C,$decimals,'.','').'</td>' ?>
+          <?= ($S===null)?'<td class="t">-</td>':'<td class="n">'.number_format($S,$decimals,'.','').'</td>' ?>
+          <?= ($SELF===null)?'<td class="t">-</td>':'<td class="n">'.number_format($SELF,$decimals,'.','').'</td>' ?>
+          <?= ($W===null)?'<td class="t">-</td>':'<td class="n">'.number_format($W,$decimals,'.','').'</td>' ?>
+        <?php endforeach; ?>
+      <?php endforeach; ?>
+    </tr>
   <?php endforeach; ?>
-<?php endif; ?>
 </table>
-<p style="font-size:12px;color:#555;margin-top:10px;">Балл «-» означает отсутствие наблюдения/ответа (score &lt; 0). Отображение чисел — с усечением до <?= (int)$decimals ?> знаков.</p>
 </body>
 </html>

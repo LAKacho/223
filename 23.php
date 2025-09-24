@@ -1,15 +1,15 @@
 <?php
-// export_competency_breakdown_detailed.php (без потери 5-го вопроса)
-// Считает СТРОГО по combination_questions. Fallback по категории включается опционально: ?fallback=1
+// export_competency_breakdown_detailed.php
+// Все оценки < 0 полностью исключаются из расчёта и детализации.
 
 require 'config.php';
 
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 
-// кол-во знаков после запятой (по умолчанию 2)
+// знаки после запятой (по умолчанию 2)
 $decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
-// включить fallback по category (не рекомендуется): ?fallback=1
+// опциональный fallback по category (по умолчанию выкл)
 $useFallback = isset($_GET['fallback']) && (int)$_GET['fallback'] === 1;
 
 // --- Процедура
@@ -35,7 +35,7 @@ $combIds   = array_map(function($r){ return (int)$r['id']; }, $competencies);
 $combNames = [];
 foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
 
-// --- Оцениваемые (таргеты)
+// --- Оцениваемые
 $st = $pdo->prepare("
   SELECT et.id AS target_id, u.fio
   FROM evaluation_targets et
@@ -56,7 +56,7 @@ $normalize = function(?string $s): string {
     return $s;
 };
 
-// --- Карта «компетенция -> список вопросов» (только combination_questions)
+// --- Карта «компетенция -> список вопросов» (основной источник — combination_questions)
 $map = []; $hasLink = [];
 foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
 
@@ -76,7 +76,7 @@ if ($combIds) {
     }
 }
 
-// --- Опциональный fallback по категории (если очень нужно)
+// --- Необязательный fallback по questions.category
 if ($useFallback) {
     $needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
     if ($needFallback) {
@@ -122,11 +122,11 @@ $roles        = ['manager','colleague','subordinate'];
 $roleLabels   = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
 $roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
 
-// --- Основная матрица средних + детализация по оценщикам
+// --- Основная матрица: средние по ролям + итог; детализация по оценщикам
 $results  = []; // $results[fio][cid] = ['M'=>avg,'C'=>avg,'S'=>avg,'W'=>weighted]
 $details  = []; // $details[fio][cid] = [ ['fio'=>..., 'role'=>..., 'avg'=>...], ... ]
 $counts   = []; // $counts[fio][cid] = ['M'=>n, 'C'=>n, 'S'=>n]
-$qCount   = []; // $qCount[cid] = кол-во вопросов у компетенции
+$qCount   = []; // $qCount[cid] = кол-во вопросов в компетенции
 
 foreach ($targets as $t) {
     $fio = $t['fio']; $tid = (int)$t['target_id'];
@@ -135,7 +135,7 @@ foreach ($targets as $t) {
     $counts[$fio]  = [];
 
     foreach ($combIds as $cid) {
-        $qids = array_values(array_unique($map[$cid] ?? [])); // на всякий случай DISTINCT
+        $qids = array_values(array_unique($map[$cid] ?? []));
         $qCount[$cid] = count($qids);
 
         if (!$qids) {
@@ -147,14 +147,16 @@ foreach ($targets as $t) {
 
         $ph = implode(',', array_fill(0, count($qids), '?'));
 
-        // 1) Средние по ролям (берём ВСЕ ответы по ВСЕМ вопросам компетенции)
+        // 1) Средние по ролям: исключаем любые оценки < 0 прямо в WHERE
         $sqlAvg = "
-          SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score,
-                 COUNT(CASE WHEN a.score >= 0 THEN 1 END) AS n
+          SELECT ep.role,
+                 AVG(a.score) AS avg_score,
+                 COUNT(*)     AS n
           FROM answers a
           JOIN evaluation_participants ep ON ep.id = a.participant_id
           WHERE ep.target_id = ?
             AND ep.role IN ('manager','colleague','subordinate')
+            AND a.score >= 0
             AND a.question_id IN ($ph)
           GROUP BY ep.role
         ";
@@ -168,6 +170,7 @@ foreach ($targets as $t) {
             $cntByRole[$r['role']] = (int)$r['n'];
         }
 
+        // нормализация весов по присутствующим ролям
         $sumW = 0; $sumV = 0;
         foreach ($roles as $rl) {
             if ($avgByRole[$rl] !== null) {
@@ -189,15 +192,16 @@ foreach ($targets as $t) {
             'S' => $cntByRole['subordinate'],
         ];
 
-        // 2) Детализация: средний оценщика по компетенции (по всем её вопросам)
+        // 2) Детализация: средний балл каждого оценщика по компетенции (исключая < 0)
         $sqlDet = "
           SELECT ep.evaluator_id, u.fio AS evaluator_fio, ep.role,
-                 AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
+                 AVG(a.score) AS avg_score
           FROM answers a
           JOIN evaluation_participants ep ON ep.id = a.participant_id
           JOIN users u ON u.id = ep.evaluator_id
           WHERE ep.target_id = ?
             AND ep.role IN ('manager','colleague','subordinate')
+            AND a.score >= 0
             AND a.question_id IN ($ph)
           GROUP BY ep.evaluator_id, u.fio, ep.role
           ORDER BY ep.role, u.fio
@@ -282,7 +286,7 @@ echo "\xEF\xBB\xBF";
       <?php endforeach; ?>
     </tr>
 
-    <!-- строка-детализация: кто как оценил по каждой компетенции -->
+    <!-- Детализация: кто как оценил по каждой компетенции -->
     <tr>
       <td class="small" style="background:#f8f9fa;">Детализация оценщиков</td>
       <?php foreach ($competencies as $c):
@@ -309,7 +313,8 @@ echo "\xEF\xBB\xBF";
                 <?php endforeach; ?>
                 <tr>
                   <td colspan="3" class="small">
-                    Всего ответов: M <?= (int)$cnts['M'] ?>; C <?= (int)$cnts['C'] ?>; S <?= (int)$cnts['S'] ?>
+                    Всего ответов (учтённых, score ≥ 0):
+                    M <?= (int)$cnts['M'] ?>; C <?= (int)$cnts['C'] ?>; S <?= (int)$cnts['S'] ?>
                   </td>
                 </tr>
               <?php endif; ?>

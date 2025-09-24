@@ -5,9 +5,8 @@ require 'config.php';
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 
-// кол-во знаков после запятой (по умолчанию 2)
+// кол-во знаков после запятой в выводе (по умолчанию 2)
 $decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
-$debug    = !empty($_GET['debug']);
 
 // --- Процедура
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
@@ -44,35 +43,105 @@ $st->execute([$procedureId]);
 $targets = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$targets) exit('В процедуре нет участников.');
 
-// --- Карта «компетенция -> ВСЕ её вопросы» (только по combination_questions, без fallback)
-$map = [];
-foreach ($combIds as $cid) { $map[$cid] = []; }
+// --- Нормализация строк
+$normalize = function(?string $s): string {
+    if ($s === null) return '';
+    $s = mb_strtolower($s, 'UTF-8');
+    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);
+    $s = preg_replace('/\s+/u', ' ', trim($s));
+    return $s;
+};
+
+// --- наборы для определения "профессиональных" компетенций
+$prof1Set = array_map($normalize, [
+  'профессиональные знания замещаемой должности',
+  'профессиональные знания ключевой должности',
+]);
+$prof2Set = array_map($normalize, [
+  'профессиональные знания должностей, смежных к текущей',
+  'профессиональные знания должностей, смежных к текущей должности',
+]);
+
+// --- Карта «компетенция -> список вопросов» (с лимитами: проф=5, прочие=4)
+$map = []; $hasLink = [];
+foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
+
+// 1) Явные связи
 if ($combIds) {
-    $in  = implode(',', array_fill(0, count($combIds), '?'));
-    $sql = "
-        SELECT cq.combination_id, cq.question_id
-        FROM combination_questions cq
-        WHERE cq.combination_id IN ($in)
-        ORDER BY cq.combination_id, cq.question_id
-    ";
-    $q = $pdo->prepare($sql);
+    $in = implode(',', array_fill(0, count($combIds), '?'));
+    $q  = $pdo->prepare("
+        SELECT combination_id, question_id
+        FROM combination_questions
+        WHERE combination_id IN ($in)
+        ORDER BY combination_id, question_id
+    ");
     $q->execute($combIds);
     foreach ($q as $row) {
-        $cid = (int)$row['combination_id'];
-        $qid = (int)$row['question_id'];
-        $map[$cid][] = $qid;
+        $map[(int)$row['combination_id']][] = (int)$row['question_id'];
+        $hasLink[(int)$row['combination_id']] = true;
     }
-}
-if ($debug) {
-    echo "<pre>Вопросов в компетенциях:\n";
-    foreach ($combIds as $cid) {
-        $nm = $combNames[$cid] ?? $cid;
-        echo $nm.": ".count($map[$cid])."\n";
-    }
-    echo "</pre>";
 }
 
-// --- Роли и веса (33.4/33.3/33.3). Если роли отсутствуют — нормализуем на присутствующие.
+// 2) Fallback: дозаполнение по category (если вообще нет явных связей)
+$needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
+if ($needFallback) {
+    $allQ = $pdo->query("SELECT id, category FROM questions ORDER BY id")->fetchAll(PDO::FETCH_ASSOC);
+
+    $groupCat = [];
+    foreach ($allQ as $row) {
+        $k = $normalize($row['category']);
+        $groupCat[$k][] = (int)$row['id'];
+    }
+
+    $synRaw = [
+        'ответственность' => 'ответственность за результат',
+        'профессиональные знания замещаемой должности' => 'профессиональные знания ключевой должности',
+        'профессиональные знания должностей, смежных к текущей' => 'профессиональные знания должностей, смежных к текущей должности',
+    ];
+    $syn = [];
+    foreach ($synRaw as $k=>$v) { $syn[$normalize($k)] = $normalize($v); }
+
+    foreach ($needFallback as $cid) {
+        $combNorm = $normalize($combNames[$cid]);
+
+        $qids = $groupCat[$combNorm] ?? null;
+
+        if (!$qids && isset($syn[$combNorm])) {
+            $alias = $syn[$combNorm];
+            $qids = $groupCat[$alias] ?? null;
+        }
+
+        if (!$qids) {
+            $bestKey = null; $bestScore = -1;
+            foreach ($groupCat as $k => $ids) {
+                $score = -1;
+                if (mb_strpos($k, $combNorm) !== false || mb_strpos($combNorm, $k) !== false) {
+                    $score = max(mb_strlen($k,'UTF-8'), mb_strlen($combNorm,'UTF-8'));
+                }
+                if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
+            }
+            if ($bestKey !== null && $bestScore >= 0) $qids = $groupCat[$bestKey];
+        }
+
+        $map[$cid] = $qids ?: [];
+    }
+}
+
+// 3) Применяем лимиты: профкомпетенции — до 5 вопросов, прочие — до 4.
+foreach ($combIds as $cid) {
+    $qids = array_values(array_unique($map[$cid])); // детерминируем и убираем дубли
+    $nameNorm = $normalize($combNames[$cid]);
+
+    $isProf = in_array($nameNorm, $prof1Set, true) || in_array($nameNorm, $prof2Set, true);
+    $limit = $isProf ? 5 : 4;
+
+    if (count($qids) > $limit) {
+        $qids = array_slice($qids, 0, $limit);
+    }
+    $map[$cid] = $qids;
+}
+
+// --- Роли и веса
 $roles        = ['manager','colleague','subordinate'];
 $roleLabels   = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
 $roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
@@ -99,7 +168,7 @@ foreach ($targets as $t) {
 
         $ph = implode(',', array_fill(0, count($qids), '?'));
 
-        // 1) Средние по ролям (как и прежде)
+        // 1) Средние по ролям
         $sqlAvg = "
           SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score,
                  COUNT(CASE WHEN a.score >= 0 THEN 1 END) AS n
@@ -120,7 +189,6 @@ foreach ($targets as $t) {
             $cntByRole[$r['role']] = (int)$r['n'];
         }
 
-        // нормализация весов по присутствующим ролям
         $sumW = 0; $sumV = 0;
         foreach ($roles as $rl) {
             if ($avgByRole[$rl] !== null) {
@@ -142,7 +210,7 @@ foreach ($targets as $t) {
             'S' => $cntByRole['subordinate'],
         ];
 
-        // 2) Детализация: средний балл каждого оценщика по данной компетенции
+        // 2) Детализация: средний балл каждого оценщика по компетенции
         $sqlDet = "
           SELECT ep.evaluator_id, u.fio AS evaluator_fio, ep.role,
                  AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
@@ -184,8 +252,8 @@ td{vertical-align:top}
 // --- Ответ как XLS
 $fname = 'competency_breakdown_detailed_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
-header('Content-Disposition: attachment; filename="'.$fname.'"');
-echo "\xEF\xBB\xBF";
+header('Content-Disposition: attachment; filename=\"'.$fname.'\"');
+echo \"\\xEF\\xBB\\xBF\";
 ?>
 <!DOCTYPE html>
 <html>
@@ -238,7 +306,6 @@ echo "\xEF\xBB\xBF";
             $rows = $details[$fio][$cid] ?? [];
             $cnts = $counts[$fio][$cid] ?? ['M'=>0,'C'=>0,'S'=>0];
 
-            // мини-таблица: ФИО | Роль | Средний по компетенции
             ob_start(); ?>
             <table class="det" cellspacing="0" cellpadding="2" style="width:100%; border-collapse:collapse;">
               <tr>

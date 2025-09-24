@@ -1,25 +1,29 @@
 <?php
 // export_competency_breakdown_detailed.php
-// Все оценки < 0 полностью исключаются из расчёта и детализации.
+// Детализация по компетенциям (M/C/S + взвешенный итог) с ФИО оценщиков.
+// Все ответы с score < 0 полностью исключаются из расчётов и не входят в средние/счётчики.
 
 require 'config.php';
 
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 
-// знаки после запятой (по умолчанию 2)
+// кол-во знаков после запятой (по умолчанию 2)
 $decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
-// опциональный fallback по category (по умолчанию выкл)
-$useFallback = isset($_GET['fallback']) && (int)$_GET['fallback'] === 1;
 
-// --- Процедура
+// включить fallback по category для компетенций без явной привязки вопросов (0/1)
+$useFallback = isset($_GET['fallback']) ? (int)$_GET['fallback'] === 1 : false;
+
+/* ===================== Загрузка справочников ===================== */
+
+// Процедура
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
 $st->execute([$procedureId]);
 $procedure = $st->fetch();
 if (!$procedure) exit('Процедура не найдена');
 $year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
 
-// --- Компетенции, привязанные к процедуре
+// Компетенции (комбинации), привязанные к процедуре
 $st = $pdo->prepare("
   SELECT c.id, c.name
   FROM procedure_combinations pc
@@ -31,11 +35,11 @@ $st->execute([$procedureId]);
 $competencies = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$competencies) exit('К процедуре не привязаны компетенции.');
 
-$combIds   = array_map(function($r){ return (int)$r['id']; }, $competencies);
+$combIds   = array_map(fn($r)=>(int)$r['id'], $competencies);
 $combNames = [];
-foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
+foreach ($competencies as $c) { $combNames[(int)$c['id']] = $c['name'] ?? ''; }
 
-// --- Оцениваемые
+// Оцениваемые (targets)
 $st = $pdo->prepare("
   SELECT et.id AS target_id, u.fio
   FROM evaluation_targets et
@@ -47,7 +51,7 @@ $st->execute([$procedureId]);
 $targets = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$targets) exit('В процедуре нет участников.');
 
-// --- Нормализация строк (для fallback)
+// Нормализация строки (для fallback по categories)
 $normalize = function(?string $s): string {
     if ($s === null) return '';
     $s = mb_strtolower($s, 'UTF-8');
@@ -56,15 +60,17 @@ $normalize = function(?string $s): string {
     return $s;
 };
 
-// --- Карта «компетенция -> список вопросов» (основной источник — combination_questions)
-$map = []; $hasLink = [];
+/* ===================== Карта «компетенция -> вопросы» ===================== */
+
+$map = [];         // $map[combination_id] = [question_id,...]
+$hasLink = [];     // было ли явное связывание через combination_questions
 foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
 
 if ($combIds) {
     $in = implode(',', array_fill(0, count($combIds), '?'));
     $q  = $pdo->prepare("
-        SELECT combination_id, question_id 
-        FROM combination_questions 
+        SELECT combination_id, question_id
+        FROM combination_questions
         WHERE combination_id IN ($in)
         ORDER BY combination_id, question_id
     ");
@@ -76,9 +82,9 @@ if ($combIds) {
     }
 }
 
-// --- Необязательный fallback по questions.category
+// Fallback по questions.category (опционально, если включён и нет явной привязки)
 if ($useFallback) {
-    $needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
+    $needFallback = array_values(array_filter($combIds, fn($cid)=>!$hasLink[$cid]));
     if ($needFallback) {
         $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
         $groupCat = [];
@@ -86,6 +92,7 @@ if ($useFallback) {
             $k = $normalize($row['category']);
             $groupCat[$k][] = (int)$row['id'];
         }
+        // простые синонимы
         $synRaw = [
             'ответственность' => 'ответственность за результат',
             'профессиональные знания замещаемой должности' => 'профессиональные знания ключевой должности',
@@ -97,6 +104,7 @@ if ($useFallback) {
         foreach ($needFallback as $cid) {
             $combNorm = $normalize($combNames[$cid]);
             $qids = $groupCat[$combNorm] ?? null;
+
             if (!$qids && isset($syn[$combNorm])) {
                 $alias = $syn[$combNorm];
                 $qids = $groupCat[$alias] ?? null;
@@ -117,22 +125,20 @@ if ($useFallback) {
     }
 }
 
-// --- Роли и веса
-$roles        = ['manager','colleague','subordinate'];
-$roleLabels   = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
-$roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
+/* ===================== Расчёт: средние по ролям и детализация ===================== */
 
-// --- Основная матрица: средние по ролям + итог; детализация по оценщикам
-$results  = []; // $results[fio][cid] = ['M'=>avg,'C'=>avg,'S'=>avg,'W'=>weighted]
-$details  = []; // $details[fio][cid] = [ ['fio'=>..., 'role'=>..., 'avg'=>...], ... ]
-$counts   = []; // $counts[fio][cid] = ['M'=>n, 'C'=>n, 'S'=>n]
-$qCount   = []; // $qCount[cid] = кол-во вопросов в компетенции
+$roles       = ['manager','colleague','subordinate']; // self не учитываем
+$roleLabels  = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
+$roleWeights = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
+
+$results = [];  // $results[fio][cid] = ['M'=>avg,'C'=>avg,'S'=>avg,'W'=>weighted]
+$details = [];  // $details[fio][cid] = [ ['fio'=>..., 'role'=>..., 'avg'=>...], ... ]
+$counts  = [];  // $counts[fio][cid]  = ['M'=>n,'C'=>n,'S'=>n]
+$qCount  = [];  // $qCount[cid] = количество вопросов, учтённых в компетенции
 
 foreach ($targets as $t) {
     $fio = $t['fio']; $tid = (int)$t['target_id'];
-    $results[$fio] = [];
-    $details[$fio] = [];
-    $counts[$fio]  = [];
+    $results[$fio] = []; $details[$fio] = []; $counts[$fio] = [];
 
     foreach ($combIds as $cid) {
         $qids = array_values(array_unique($map[$cid] ?? []));
@@ -147,7 +153,7 @@ foreach ($targets as $t) {
 
         $ph = implode(',', array_fill(0, count($qids), '?'));
 
-        // 1) Средние по ролям: исключаем любые оценки < 0 прямо в WHERE
+        // 1) Средние по ролям (исключаем любые score < 0)
         $sqlAvg = "
           SELECT ep.role,
                  AVG(a.score) AS avg_score,
@@ -170,7 +176,7 @@ foreach ($targets as $t) {
             $cntByRole[$r['role']] = (int)$r['n'];
         }
 
-        // нормализация весов по присутствующим ролям
+        // Нормализация весов на присутствующие роли
         $sumW = 0; $sumV = 0;
         foreach ($roles as $rl) {
             if ($avgByRole[$rl] !== null) {
@@ -192,7 +198,7 @@ foreach ($targets as $t) {
             'S' => $cntByRole['subordinate'],
         ];
 
-        // 2) Детализация: средний балл каждого оценщика по компетенции (исключая < 0)
+        // 2) Детализация по оценщикам (исключаем score < 0)
         $sqlDet = "
           SELECT ep.evaluator_id, u.fio AS evaluator_fio, ep.role,
                  AVG(a.score) AS avg_score
@@ -221,7 +227,8 @@ foreach ($targets as $t) {
     }
 }
 
-// --- CSS для Excel-совместимого HTML
+/* ===================== Вывод XLS (HTML совместимый) ===================== */
+
 $fmt = ($decimals > 0) ? ('0.'.str_repeat('0', $decimals)) : '0';
 $css = "
 .num{mso-number-format:'{$fmt}';text-align:center}
@@ -233,7 +240,6 @@ td{vertical-align:top}
 .warn{color:#b00;font-weight:bold}
 ";
 
-// --- Ответ как XLS
 $fname = 'competency_breakdown_detailed_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
 header('Content-Disposition: attachment; filename="'.$fname.'"');
@@ -267,7 +273,7 @@ echo "\xEF\xBB\xBF";
     <?php endforeach; ?>
   </tr>
   <tr>
-    <?php foreach ($competencies as $c): ?>
+    <?php foreach ($competencies as $_): ?>
       <th>M</th><th>C</th><th>S</th><th>Итог</th>
     <?php endforeach; ?>
   </tr>
@@ -286,7 +292,7 @@ echo "\xEF\xBB\xBF";
       <?php endforeach; ?>
     </tr>
 
-    <!-- Детализация: кто как оценил по каждой компетенции -->
+    <!-- Детализация: список оценщиков и их средние по компетенции -->
     <tr>
       <td class="small" style="background:#f8f9fa;">Детализация оценщиков</td>
       <?php foreach ($competencies as $c):
@@ -308,12 +314,12 @@ echo "\xEF\xBB\xBF";
                   <tr>
                     <td><?= htmlspecialchars($rr['fio']) ?></td>
                     <td class="txt"><?= htmlspecialchars($roleLabels[$rr['role']] ?? $rr['role']) ?></td>
-                    <td class="num"><?= ($rr['avg']===null?'':number_format($rr['avg'], $decimals, '.', '')) ?></td>
+                    <td class="num"><?= ($rr['avg']===null ? '' : number_format($rr['avg'], $decimals, '.', '')) ?></td>
                   </tr>
                 <?php endforeach; ?>
                 <tr>
                   <td colspan="3" class="small">
-                    Всего ответов (учтённых, score ≥ 0):
+                    Учтённых ответов (score ≥ 0):
                     M <?= (int)$cnts['M'] ?>; C <?= (int)$cnts['C'] ?>; S <?= (int)$cnts['S'] ?>
                   </td>
                 </tr>

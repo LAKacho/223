@@ -1,18 +1,10 @@
 <?php
-// export_role_averages_xls.php
-// ВЫГРУЗКА: средние баллы по ответам по каждой роли.
-// Формат: строка = оцениваемый; по колонкам — блоки ролей:
-//   [Итог по роли] + [по всем компетенциям этой процедуры]
-// Расчёты: усреднение только по реальным ответам (score>=0).
-// Отображение: усечение до ?dec= знаков (как визуальный формат в Excel).
-
 require 'config.php';
 
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 $decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
 
-// -------- helpers: truncate like excel cell format --------
 function trunc_dec($x, int $n): float {
     $p = pow(10, $n);
     return ($x >= 0) ? floor($x * $p) / $p : ceil($x * $p) / $p;
@@ -22,13 +14,11 @@ function fmt_dec($x, int $n): string {
     return number_format($v, $n, '.', '');
 }
 
-// -------- procedure --------
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
 $st->execute([$procedureId]);
 $procedure = $st->fetch() ?: exit('Процедура не найдена');
 $year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
 
-// -------- competencies of procedure --------
 $st = $pdo->prepare("
   SELECT c.id, c.name
   FROM procedure_combinations pc
@@ -44,7 +34,6 @@ $combIds   = array_map(fn($r)=>(int)$r['id'], $competencies);
 $combNames = [];
 foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
 
-// -------- targets (assessed) --------
 $st = $pdo->prepare("
   SELECT et.id AS target_id, u.fio
   FROM evaluation_targets et
@@ -56,7 +45,6 @@ $st->execute([$procedureId]);
 $targets = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$targets) exit('В процедуре нет участников.');
 
-// -------- build mapping: combination -> question ids --------
 $normalize = function(?string $s): string {
     if ($s === null) return '';
     $s = mb_strtolower($s, 'UTF-8');
@@ -68,7 +56,6 @@ $normalize = function(?string $s): string {
 $map = []; $hasLink = [];
 foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
 
-// прямые связи
 if ($combIds) {
     $in = implode(',', array_fill(0, count($combIds), '?'));
     $q  = $pdo->prepare("SELECT combination_id, question_id FROM combination_questions WHERE combination_id IN ($in)");
@@ -79,7 +66,6 @@ if ($combIds) {
     }
 }
 
-// fallback по категориям
 $needFallback = array_values(array_filter($combIds, fn($cid)=>!$hasLink[$cid]));
 if ($needFallback) {
     $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
@@ -121,19 +107,15 @@ if ($needFallback) {
     }
 }
 
-// -------- roles (self не выводим, по запросу добавлю) --------
 $roles       = ['manager','colleague','subordinate'];
 $roleLabels  = ['manager'=>'Руководитель', 'colleague'=>'Коллеги', 'subordinate'=>'Подчинённые'];
 
-// -------- collect averages per role & competency --------
-// result[row][role]['total'] and ['by_cid'][cid] = avg
-$rows = [];  // $rows[fio][role] = ['total'=>float|null,'by_cid'=>[cid=>float|null]]
+$rows = [];  
 
 foreach ($targets as $t) {
     $fio = $t['fio']; $tid = (int)$t['target_id'];
     $rows[$fio] = [];
 
-    // для каждого role — массив по компетенциям
     foreach ($roles as $rl) {
         $rows[$fio][$rl] = ['total'=>null, 'by_cid'=>[]];
     }
@@ -168,7 +150,6 @@ foreach ($targets as $t) {
         }
     }
 
-    // итоги по роли: среднее из компетенций, где есть значение
     foreach ($roles as $rl) {
         $vals = array_values(array_filter(
             $rows[$fio][$rl]['by_cid'],
@@ -178,7 +159,6 @@ foreach ($targets as $t) {
     }
 }
 
-// -------- build header and output (HTML/XLS) --------
 $fmtMask = ($decimals > 0) ? "0." . str_repeat('0', $decimals) : "0";
 $css = "
 .num{mso-number-format:'{$fmtMask}';text-align:center}
@@ -208,7 +188,6 @@ echo "\xEF\xBB\xBF";
     </th>
   </tr>
 
-  <!-- линия с заголовками-блоками по ролям -->
   <tr>
     <th rowspan="2">Кого оценивали (ФИО)</th>
     <?php foreach ($roles as $rl): ?>
@@ -243,8 +222,7 @@ echo "\xEF\xBB\xBF";
 </table>
 
 <p style="font-size:12px;color:#555;margin-top:10px;">
-  Примечание: итог по роли — среднее из всех компетенций, где есть ответы по данной роли. Числа
-  показываются с усечением до <?= (int)$decimals ?> знаков после запятой (как визуальный формат Excel).
+ <?= (int)$decimals ?> 
 </p>
 
 </body>

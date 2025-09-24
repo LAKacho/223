@@ -1,17 +1,21 @@
 <?php
-
+// export_competency_breakdown_detailed.php
 require 'config.php';
 
 $procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
 if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
 
-$decimals = isset($_GET['dec']) ? max(1, (int)$_GET['dec']) : 2;
+// кол-во знаков после запятой в выводе (по умолчанию 2)
+$decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
 
+// --- Процедура
 $st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
 $st->execute([$procedureId]);
-$procedure = $st->fetch() ?: exit('Процедура не найдена');
+$procedure = $st->fetch();
+if (!$procedure) exit('Процедура не найдена');
 $year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
 
+// --- Компетенции (комбинации), привязанные к процедуре
 $st = $pdo->prepare("
   SELECT c.id, c.name
   FROM procedure_combinations pc
@@ -23,10 +27,11 @@ $st->execute([$procedureId]);
 $competencies = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$competencies) exit('К процедуре не привязаны компетенции.');
 
-$combIds   = array_map(fn($r)=>(int)$r['id'], $competencies);
+$combIds   = array_map(function($r){ return (int)$r['id']; }, $competencies);
 $combNames = [];
 foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
 
+// --- Оцениваемые (таргеты)
 $st = $pdo->prepare("
   SELECT et.id AS target_id, u.fio
   FROM evaluation_targets et
@@ -38,14 +43,16 @@ $st->execute([$procedureId]);
 $targets = $st->fetchAll(PDO::FETCH_ASSOC);
 if (!$targets) exit('В процедуре нет участников.');
 
+// --- Нормализация строк
 $normalize = function(?string $s): string {
     if ($s === null) return '';
     $s = mb_strtolower($s, 'UTF-8');
-    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);   
+    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);
     $s = preg_replace('/\s+/u', ' ', trim($s));
     return $s;
 };
 
+// --- Карта «компетенция -> список вопросов»
 $map = []; $hasLink = [];
 foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
 
@@ -59,7 +66,8 @@ if ($combIds) {
     }
 }
 
-$needFallback = array_values(array_filter($combIds, fn($cid)=>!$hasLink[$cid]));
+// --- Fallback: если у компетенции нет явной привязки вопросов, подхватываем по category
+$needFallback = array_values(array_filter($combIds, function($cid) use ($hasLink){ return !$hasLink[$cid]; }));
 if ($needFallback) {
     $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -88,11 +96,12 @@ if ($needFallback) {
         }
 
         if (!$qids) {
+            // простое "похожесть"-сопоставление без str_contains (совместимо со старыми PHP)
             $bestKey = null; $bestScore = -1;
             foreach ($groupCat as $k => $ids) {
                 $score = -1;
-                if (str_contains($k, $combNorm) || str_contains($combNorm, $k)) {
-                    $score = max(strlen($k), strlen($combNorm));
+                if (mb_strpos($k, $combNorm) !== false || mb_strpos($combNorm, $k) !== false) {
+                    $score = max(mb_strlen($k,'UTF-8'), mb_strlen($combNorm,'UTF-8'));
                 }
                 if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
             }
@@ -103,23 +112,37 @@ if ($needFallback) {
     }
 }
 
-$roles        = ['manager','colleague','subordinate']; 
+// --- Роли и веса (как в исходнике: 33.4/33.3/33.3)
+$roles        = ['manager','colleague','subordinate'];
 $roleLabels   = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
 $roleWeights  = ['manager'=>0.334, 'colleague'=>0.333, 'subordinate'=>0.333];
 
-$results = [];
+// --- Основная матрица средних + детализация по оценщикам
+$results  = []; // $results[fio][cid] = ['M'=>avg,'C'=>avg,'S'=>avg,'W'=>weighted]
+$details  = []; // $details[fio][cid] = [ ['fio'=>..., 'role'=>..., 'avg'=>...], ... ]
+$counts   = []; // $counts[fio][cid] = ['M'=>n, 'C'=>n, 'S'=>n]
 
 foreach ($targets as $t) {
     $fio = $t['fio']; $tid = (int)$t['target_id'];
     $results[$fio] = [];
+    $details[$fio] = [];
+    $counts[$fio]  = [];
 
     foreach ($combIds as $cid) {
         $qids = $map[$cid] ?? [];
-        if (!$qids) { $results[$fio][$cid] = ['M'=>null,'C'=>null,'S'=>null,'W'=>null]; continue; }
+        if (!$qids) {
+            $results[$fio][$cid] = ['M'=>null,'C'=>null,'S'=>null,'W'=>null];
+            $details[$fio][$cid] = [];
+            $counts[$fio][$cid]  = ['M'=>0,'C'=>0,'S'=>0];
+            continue;
+        }
 
         $ph = implode(',', array_fill(0, count($qids), '?'));
-        $sql = "
-          SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
+
+        // 1) Средние по ролям (как и прежде)
+        $sqlAvg = "
+          SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score,
+                 COUNT(CASE WHEN a.score >= 0 THEN 1 END) AS n
           FROM answers a
           JOIN evaluation_participants ep ON ep.id = a.participant_id
           WHERE ep.target_id = ?
@@ -127,12 +150,14 @@ foreach ($targets as $t) {
             AND a.question_id IN ($ph)
           GROUP BY ep.role
         ";
-        $stmt = $pdo->prepare($sql);
+        $stmt = $pdo->prepare($sqlAvg);
         $stmt->execute(array_merge([$tid], $qids));
 
         $avgByRole = ['manager'=>null,'colleague'=>null,'subordinate'=>null];
+        $cntByRole = ['manager'=>0,'colleague'=>0,'subordinate'=>0];
         foreach ($stmt as $r) {
             if ($r['avg_score'] !== null) $avgByRole[$r['role']] = (float)$r['avg_score'];
+            $cntByRole[$r['role']] = (int)$r['n'];
         }
 
         $sumW = 0; $sumV = 0;
@@ -150,22 +175,54 @@ foreach ($targets as $t) {
             'S' => $avgByRole['subordinate'],
             'W' => $weighted,
         ];
+        $counts[$fio][$cid] = [
+            'M' => $cntByRole['manager'],
+            'C' => $cntByRole['colleague'],
+            'S' => $cntByRole['subordinate'],
+        ];
+
+        // 2) Детализация: кто именно и сколько поставил (средний балл оценщика по компетенции)
+        //    усредняем по всем вопросам компетенции для конкретного оценщика
+        $sqlDet = "
+          SELECT ep.evaluator_id, u.fio AS evaluator_fio, ep.role,
+                 AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
+          FROM answers a
+          JOIN evaluation_participants ep ON ep.id = a.participant_id
+          JOIN users u ON u.id = ep.evaluator_id
+          WHERE ep.target_id = ?
+            AND ep.role IN ('manager','colleague','subordinate')
+            AND a.question_id IN ($ph)
+          GROUP BY ep.evaluator_id, u.fio, ep.role
+          ORDER BY ep.role, u.fio
+        ";
+        $stmt2 = $pdo->prepare($sqlDet);
+        $stmt2->execute(array_merge([$tid], $qids));
+
+        $rows = [];
+        foreach ($stmt2 as $r2) {
+            $rows[] = [
+                'fio'  => $r2['evaluator_fio'],
+                'role' => $r2['role'],
+                'avg'  => ($r2['avg_score'] !== null) ? (float)$r2['avg_score'] : null,
+            ];
+        }
+        $details[$fio][$cid] = $rows;
     }
 }
 
-$css = '';
-if (is_file(__DIR__.'/34.html')) {
-    $tpl = file_get_contents(__DIR__.'/34.html');
-    if (preg_match('~<style[^>]*>(.*?)</style>~is', $tpl, $m)) $css = $m[1];
-}
-$fmt = str_repeat('0', max(0,$decimals));
-$css .= "
-.num{mso-number-format:'0".($decimals?'.'.$fmt:'')."';text-align:center}
+// --- CSS для Excel-совместимого HTML
+$fmt = ($decimals > 0) ? ('0.'.str_repeat('0', $decimals)) : '0';
+$css = "
+.num{mso-number-format:'{$fmt}';text-align:center}
 .txt{text-align:center}
 th{font-weight:bold;text-align:center}
+td{vertical-align:top}
+.small{font-size:11px}
+.det th, .det td{border:1px solid #999;padding:3px}
 ";
 
-$fname = 'competency_breakdown_'.$procedureId.'.xls';
+// --- Ответ как XLS
+$fname = 'competency_breakdown_detailed_'.$procedureId.'.xls';
 header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
 header('Content-Disposition: attachment; filename="'.$fname.'"');
 echo "\xEF\xBB\xBF";
@@ -179,9 +236,9 @@ echo "\xEF\xBB\xBF";
 </head>
 <body>
 
-<table border="1" cellspacing="0" cellpadding="3">
+<table border="1" cellspacing="0" cellpadding="4">
   <tr>
-    <th colspan="<?= 1 + count($competencies)*4 ?>">Детализация оценки по компетенциям (M/C/S + взвешенный итог)</th>
+    <th colspan="<?= 1 + count($competencies)*4 ?>">Детализация оценки по компетенциям (M/C/S + взвешенный итог) с ФИО оценщиков</th>
   </tr>
   <tr>
     <th colspan="<?= 1 + count($competencies)*4 ?>"><?= htmlspecialchars($procedure['title']) ?> — <?= $year ?> г.</th>
@@ -199,10 +256,9 @@ echo "\xEF\xBB\xBF";
     <?php endforeach; ?>
   </tr>
 
-  <!-- Данные -->
   <?php foreach ($results as $fio => $byCid): ?>
     <tr>
-      <td class="txt"><?= htmlspecialchars($fio) ?></td>
+      <td class="txt"><strong><?= htmlspecialchars($fio) ?></strong></td>
       <?php foreach ($competencies as $c):
             $cid = (int)$c['id'];
             $row = $byCid[$cid] ?? ['M'=>null,'C'=>null,'S'=>null,'W'=>null];
@@ -211,6 +267,45 @@ echo "\xEF\xBB\xBF";
         <?= ($C === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($C, $decimals, '.', '').'</td>' ?>
         <?= ($S === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($S, $decimals, '.', '').'</td>' ?>
         <?= ($W === null) ? '<td class="txt">-</td>' : '<td class="num">'.number_format($W, $decimals, '.', '').'</td>' ?>
+      <?php endforeach; ?>
+    </tr>
+
+    <!-- строка-детализация: кто как оценил по каждой компетенции -->
+    <tr>
+      <td class="small" style="background:#f8f9fa;">Детализация оценщиков</td>
+      <?php foreach ($competencies as $c):
+            $cid = (int)$c['id'];
+            $rows = $details[$fio][$cid] ?? [];
+            $cnts = $counts[$fio][$cid] ?? ['M'=>0,'C'=>0,'S'=>0];
+
+            // мини-таблица: ФИО | Роль | Средний по компетенции
+            ob_start(); ?>
+            <table class="det" cellspacing="0" cellpadding="2" style="width:100%; border-collapse:collapse;">
+              <tr>
+                <th>ФИО</th>
+                <th>Роль</th>
+                <th>Средний балл</th>
+              </tr>
+              <?php if (!$rows): ?>
+                <tr><td colspan="3" class="txt">Нет данных</td></tr>
+              <?php else: ?>
+                <?php foreach ($rows as $rr): ?>
+                  <tr>
+                    <td><?= htmlspecialchars($rr['fio']) ?></td>
+                    <td class="txt"><?= htmlspecialchars($roleLabels[$rr['role']] ?? $rr['role']) ?></td>
+                    <td class="num"><?= ($rr['avg']===null?'':number_format($rr['avg'], $decimals, '.', '')) ?></td>
+                  </tr>
+                <?php endforeach; ?>
+                <tr>
+                  <td colspan="3" class="small">
+                    Всего оценок (по ответам): 
+                    M: <?= (int)$cnts['M'] ?> &nbsp; C: <?= (int)$cnts['C'] ?> &nbsp; S: <?= (int)$cnts['S'] ?>
+                  </td>
+                </tr>
+              <?php endif; ?>
+            </table>
+            <?php $mini = ob_get_clean();
+            echo '<td colspan="4">'.$mini.'</td>'; ?>
       <?php endforeach; ?>
     </tr>
   <?php endforeach; ?>

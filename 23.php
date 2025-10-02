@@ -1,253 +1,180 @@
-<?php
-// export_competency_breakdown_xls.php
-// Детализация по компетенциям: M / C / S и взвешенный итог.
-// Политика округления "как в Excel по умолчанию":
-// - в вычислениях полная точность (double)
-// - при выводе усечение (truncate) до ?dec= знаков (по умолчанию 2)
+// video.js — "тихий" фотоснимок перед тестом без блокировок стрима/записи
+// Работает так:
+// 1) Поднимает (или переиспользует) общий stream в <video id="video">.
+// 2) Через 200–400 мс делает снимок кадра (ImageCapture или canvas) и отправляет в photoSave.php.
+// 3) В любом случае (успех/ошибка/таймаут) — кидает событие и, если есть, вызывает startAfterPhoto() из zetta32.js.
+// Никаких UI-оверлеев и ожиданий face-api — тест не блокируется.
 
-require 'config.php';
+(function () {
+  'use strict';
 
-$procedureId = isset($_GET['procedure_id']) ? (int)$_GET['procedure_id'] : 0;
-if ($procedureId <= 0) { http_response_code(400); exit('Нужно передать ?procedure_id='); }
+  // --- Настройки ---
+  const FIRST_FRAME_DELAY_MS = 300;       // даём камере "проснуться"
+  const VIDEO_READY_TIMEOUT_MS = 1500;    // максимум ждём готовности кадра
+  const FACEAPI_TIMEOUT_MS = 1500;        // пробуем подгрузить face-api, но не ждём дольше
+  const UPLOAD_URL = 'photoSave.php';     // серверный приёмник фото (cookie id обязателен на сервере)
 
-// Сколько знаков показывать
-$decimals = isset($_GET['dec']) ? max(0, (int)$_GET['dec']) : 2;
+  // --- Гард от двойного запуска ---
+  if (window.__facePhotoKick) return;
+  window.__facePhotoKick = true;
 
-// --- Помощники округления/форматирования ---
-// Усечение до N знаков (как визуальный формат в Excel без ROUND)
-function trunc_dec($x, int $n): float {
-    $p = pow(10, $n);
-    // учитываем отрицательные значения корректно
-    return ($x >= 0) ? floor($x * $p) / $p : ceil($x * $p) / $p;
-}
-function fmt_dec($x, int $n): string {
-    // показываем именно усечённое значение
-    $v = trunc_dec((float)$x, $n);
-    return number_format($v, $n, '.', '');
-}
+  // --- Утилиты ---
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  function dispatch(name, detail) {
+    try { document.dispatchEvent(new CustomEvent(name, { detail })); } catch {}
+  }
 
-// --- Загружаем процедуру ---
-$st = $pdo->prepare("SELECT id, title, start_date FROM evaluation_procedures WHERE id=?");
-$st->execute([$procedureId]);
-$procedure = $st->fetch();
-if (!$procedure) exit('Процедура не найдена');
-$year = $procedure['start_date'] ? (new DateTime($procedure['start_date']))->format('Y') : date('Y');
+  function getVideoEl() {
+    return document.getElementById('video') || document.querySelector('video');
+  }
 
-// --- Компетенции, привязанные к процедуре ---
-$st = $pdo->prepare("
-  SELECT c.id, c.name
-  FROM procedure_combinations pc
-  JOIN combinations c ON c.id = pc.combination_id
-  WHERE pc.procedure_id = ?
-  ORDER BY c.name
-");
-$st->execute([$procedureId]);
-$competencies = $st->fetchAll(PDO::FETCH_ASSOC);
-if (!$competencies) exit('К процедуре не привязаны компетенции.');
+  async function ensureStream() {
+    // 1) Уже есть общий стрим?
+    if (window.__camStream) return window.__camStream;
 
-$combIds   = array_map(fn($r)=>(int)$r['id'], $competencies);
-$combNames = [];
-foreach ($competencies as $c) $combNames[(int)$c['id']] = $c['name'] ?? '';
-
-// --- Участники процедуры (оцениваемые) ---
-$st = $pdo->prepare("
-  SELECT et.id AS target_id, u.fio
-  FROM evaluation_targets et
-  JOIN users u ON u.id = et.user_id
-  WHERE et.procedure_id = ?
-  ORDER BY u.fio
-");
-$st->execute([$procedureId]);
-$targets = $st->fetchAll(PDO::FETCH_ASSOC);
-if (!$targets) exit('В процедуре нет участников.');
-
-// --- Нормализация строк для fallback по категориям ---
-$normalize = function(?string $s): string {
-    if ($s === null) return '';
-    $s = mb_strtolower($s, 'UTF-8');
-    $s = preg_replace('/^[0-9.\-\s]+/u', '', $s);
-    $s = preg_replace('/\s+/u', ' ', trim($s));
-    return $s;
-};
-
-// --- Карта "компетенция -> вопросы" ---
-$map = []; $hasLink = [];
-foreach ($combIds as $cid) { $map[$cid] = []; $hasLink[$cid] = false; }
-
-if ($combIds) {
-    $in = implode(',', array_fill(0, count($combIds), '?'));
-    $q  = $pdo->prepare("SELECT combination_id, question_id FROM combination_questions WHERE combination_id IN ($in)");
-    $q->execute($combIds);
-    foreach ($q as $row) {
-        $map[(int)$row['combination_id']][] = (int)$row['question_id'];
-        $hasLink[(int)$row['combination_id']] = true;
-    }
-}
-
-// --- Fallback: если к компетенции не привязали вопросы, используем категории из questions ---
-$needFallback = array_values(array_filter($combIds, fn($cid)=>!$hasLink[$cid]));
-if ($needFallback) {
-    $allQ = $pdo->query("SELECT id, category FROM questions")->fetchAll(PDO::FETCH_ASSOC);
-
-    $groupCat = [];
-    foreach ($allQ as $row) {
-        $k = $normalize($row['category']);
-        $groupCat[$k][] = (int)$row['id'];
+    // 2) Уже есть превью в <video>?
+    const v = getVideoEl();
+    if (v && v.srcObject && v.srcObject.getTracks && v.srcObject.getTracks().length) {
+      window.__camStream = v.srcObject;
+      return window.__camStream;
     }
 
-    $synRaw = [
-        'ответственность' => 'ответственность за результат',
-        'профессиональные знания замещаемой должности' => 'профессиональные знания ключевой должности',
-        'профессиональные знания должностей, смежных к текущей' => 'профессиональные знания должностей, смежных к текущей должности',
-    ];
-    $syn = [];
-    foreach ($synRaw as $k=>$v) { $syn[$normalize($k)] = $normalize($v); }
+    // 3) Берём новый общий стрим (видео+аудио — чтобы потом zetta32 мог писать сразу)
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
 
-    foreach ($needFallback as $cid) {
-        $combNorm = $normalize($combNames[$cid]);
+    if (v) {
+      v.srcObject = stream;
+      try { await v.play(); } catch {}
+    }
+    window.__camStream = stream;
+    return stream;
+  }
 
-        $qids = $groupCat[$combNorm] ?? null;
+  async function waitVideoReady(maxWaitMs) {
+    const v = getVideoEl();
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      if (v && v.videoWidth > 0 && v.videoHeight > 0) return true;
+      await sleep(50);
+    }
+    return false;
+  }
 
-        if (!$qids && isset($syn[$combNorm])) {
-            $alias = $syn[$combNorm];
-            $qids = $groupCat[$alias] ?? null;
+  function grabFrameFromStream(stream) {
+    // Пытаемся через ImageCapture, иначе — через canvas с <video>.
+    return new Promise(async (resolve, reject) => {
+      const v = getVideoEl();
+      const track = stream && stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
+
+      async function viaCanvas() {
+        try {
+          if (!v || !v.videoWidth) throw new Error('video_not_ready');
+          const c = document.createElement('canvas');
+          c.width = v.videoWidth;
+          c.height = v.videoHeight;
+          const ctx = c.getContext('2d');
+          ctx.drawImage(v, 0, 0);
+          c.toBlob(b => b ? resolve(b) : reject(new Error('toBlob_failed')), 'image/jpeg', 0.85);
+        } catch (e) { reject(e); }
+      }
+
+      try {
+        if ('ImageCapture' in window && track) {
+          const ic = new ImageCapture(track);
+          ic.grabFrame().then((bmp) => {
+            const c = document.createElement('canvas');
+            c.width = bmp.width;
+            c.height = bmp.height;
+            const ctx = c.getContext('2d');
+            ctx.drawImage(bmp, 0, 0);
+            c.toBlob(b => b ? resolve(b) : viaCanvas(), 'image/jpeg', 0.85);
+          }).catch(viaCanvas);
+        } else {
+          viaCanvas();
         }
+      } catch {
+        viaCanvas();
+      }
+    });
+  }
 
-        if (!$qids) {
-            $bestKey = null; $bestScore = -1;
-            foreach ($groupCat as $k => $ids) {
-                $score = -1;
-                if (mb_strpos($k, $combNorm) !== false || mb_strpos($combNorm, $k) !== false) {
-                    $score = max(mb_strlen($k,'UTF-8'), mb_strlen($combNorm,'UTF-8'));
-                }
-                if ($score > $bestScore) { $bestScore = $score; $bestKey = $k; }
-            }
-            if ($bestKey !== null && $bestScore >= 0) $qids = $groupCat[$bestKey];
-        }
+  // Опционально: быстрая подгрузка face-api без блокировки (для совместимости со старым пайплайном)
+  function loadScriptWithTimeout(src, timeoutMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      const s = document.createElement('script');
+      s.src = src;
+      s.async = true;
+      s.onload = () => { if (!done) { done = true; resolve(true); } };
+      s.onerror = () => { if (!done) { done = true; resolve(false); } };
+      document.head.appendChild(s);
+      setTimeout(() => { if (!done) { done = true; resolve(false); } }, timeoutMs);
+    });
+  }
 
-        $map[$cid] = $qids ?: [];
+  async function maybeLoadFaceApi() {
+    try {
+      if (window.faceapi && faceapi.nets && faceapi.nets.tinyFaceDetector && faceapi.nets.tinyFaceDetector.params) {
+        return true;
+      }
+      const ok = await loadScriptWithTimeout('/camera1/face-api.min.js', FACEAPI_TIMEOUT_MS);
+      if (!ok || !window.faceapi) return false;
+      // Загружаем модели, но не ждём бесконечно
+      const p = faceapi.nets.tinyFaceDetector.loadFromUri('/camera1/models/');
+      // не дожидаемся завершения загрузки — пусть грузится фоном
+      Promise.race([p, sleep(FACEAPI_TIMEOUT_MS)]).catch(() => {});
+      return true;
+    } catch { return false; }
+  }
+
+  async function uploadPhoto(blob) {
+    const fd = new FormData();
+    fd.append('photo', blob, 'face.jpg'); // cookie id на сервере обязателен
+    const resp = await fetch(UPLOAD_URL, { method: 'POST', body: fd });
+    const text = (await resp.text()).trim().toLowerCase();
+    return text === 'success';
+  }
+
+  async function takePhotoSilently() {
+    try {
+      // 1) Гарантируем единый стрим и превью
+      const stream = await ensureStream();
+
+      // 2) Даём камере собрать первый кадр
+      await sleep(FIRST_FRAME_DELAY_MS);
+      await waitVideoReady(VIDEO_READY_TIMEOUT_MS);
+
+      // 3) Пробуем подгрузить face-api, но не блокируемся
+      maybeLoadFaceApi(); // без await — не мешаем тесту и записи
+
+      // 4) Берём кадр
+      const blob = await grabFrameFromStream(stream);
+
+      // 5) Отправляем на сервер
+      const ok = await uploadPhoto(blob);
+
+      if (ok) {
+        dispatch('face-photo-saved', { server: 'success' });
+      } else {
+        dispatch('face-photo-failed', { server: 'unexpected_response' });
+      }
+    } catch (e) {
+      // Любая ошибка — не блокируем: просто сигналим, что фото не удалось
+      dispatch('face-photo-failed', { reason: 'exception', error: String(e) });
+    } finally {
+      // 6) В любом случае — даём системе продолжить запись/тест
+      if (typeof window.startAfterPhoto === 'function') {
+        try { window.startAfterPhoto(); } catch {}
+      }
+      dispatch('face-photo-done');
     }
-}
+  }
 
-// --- Правила ролей и итог по компетенции ---
-// Роли, которые учитываем
-$roles      = ['manager','colleague','subordinate'];
-$roleLabels = ['manager'=>'Руководитель','colleague'=>'Коллеги','subordinate'=>'Подчинённые'];
+  // Стартуем при загрузке документа
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', takePhotoSilently, { once: true });
+  } else {
+    takePhotoSilently();
+  }
 
-// Итог по компетенции с динамическими долями ролей:
-// присутствуют 3 роли → по 1/3; 2 роли → 50/50; 1 роль → 100%
-function avgByPresentRoles(array $avgByRole): ?float {
-    $vals = [];
-    foreach (['manager','colleague','subordinate'] as $r) {
-        if ($avgByRole[$r] !== null) $vals[] = (float)$avgByRole[$r];
-    }
-    $n = count($vals);
-    if ($n === 0) return null;
-    return array_sum($vals) / $n;
-}
-
-// --- Расчёт M/C/S и итогов по компетенциям ---
-$results = []; // $results[fio][combination_id] = ['M'=>..., 'C'=>..., 'S'=>..., 'W'=>...]
-
-foreach ($targets as $t) {
-    $fio = $t['fio']; $tid = (int)$t['target_id'];
-    $results[$fio] = [];
-
-    foreach ($combIds as $cid) {
-        $qids = $map[$cid] ?? [];
-        if (!$qids) { $results[$fio][$cid] = ['M'=>null,'C'=>null,'S'=>null,'W'=>null]; continue; }
-
-        $ph = implode(',', array_fill(0, count($qids), '?'));
-        $sql = "
-          SELECT ep.role, AVG(CASE WHEN a.score >= 0 THEN a.score END) AS avg_score
-          FROM answers a
-          JOIN evaluation_participants ep ON ep.id = a.participant_id
-          WHERE ep.target_id = ?
-            AND ep.role IN ('manager','colleague','subordinate')
-            AND a.question_id IN ($ph)
-          GROUP BY ep.role
-        ";
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute(array_merge([$tid], $qids));
-
-        $avgByRole = ['manager'=>null,'colleague'=>null,'subordinate'=>null];
-        foreach ($stmt as $r) {
-            if ($r['avg_score'] !== null) $avgByRole[$r['role']] = (float)$r['avg_score'];
-        }
-
-        $weighted = avgByPresentRoles($avgByRole);
-
-        $results[$fio][$cid] = [
-            'M' => $avgByRole['manager'],
-            'C' => $avgByRole['colleague'],
-            'S' => $avgByRole['subordinate'],
-            'W' => $weighted,
-        ];
-    }
-}
-
-// --- Генерация Excel (HTML) ---
-$fmtMask = ($decimals > 0) ? "0." . str_repeat('0', $decimals) : "0";
-$css = "
-.num{mso-number-format:'{$fmtMask}';text-align:center}
-.txt{text-align:center}
-th{font-weight:bold;text-align:center}
-";
-
-$fname = 'competency_breakdown_'.$procedureId.'.xls';
-header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
-header('Content-Disposition: attachment; filename="'.$fname.'"');
-echo "\xEF\xBB\xBF";
-?>
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title><?= htmlspecialchars($procedure['title']) ?></title>
-<style><?= $css ?></style>
-</head>
-<body>
-
-<table border="1" cellspacing="0" cellpadding="3">
-  <tr>
-    <th colspan="<?= 1 + count($competencies)*4 ?>">Детализация оценки по компетенциям (M/C/S + итог)</th>
-  </tr>
-  <tr>
-    <th colspan="<?= 1 + count($competencies)*4 ?>"><?= htmlspecialchars($procedure['title']) ?> — <?= $year ?> г.</th>
-  </tr>
-
-  <tr>
-    <th rowspan="2">Сотрудник</th>
-    <?php foreach ($competencies as $c): ?>
-      <th colspan="4"><?= htmlspecialchars($c['name']) ?></th>
-    <?php endforeach; ?>
-  </tr>
-  <tr>
-    <?php foreach ($competencies as $c): ?>
-      <th>M</th><th>C</th><th>S</th><th>Итог</th>
-    <?php endforeach; ?>
-  </tr>
-
-  <?php foreach ($results as $fio => $byCid): ?>
-    <tr>
-      <td class="txt"><?= htmlspecialchars($fio) ?></td>
-      <?php foreach ($competencies as $c):
-            $cid = (int)$c['id'];
-            $row = $byCid[$cid] ?? ['M'=>null,'C'=>null,'S'=>null,'W'=>null];
-            $M = $row['M']; $C = $row['C']; $S = $row['S']; $W = $row['W']; ?>
-        <?= ($M === null) ? '<td class="txt">-</td>' : '<td class="num">'.fmt_dec($M, $decimals).'</td>' ?>
-        <?= ($C === null) ? '<td class="txt">-</td>' : '<td class="num">'.fmt_dec($C, $decimals).'</td>' ?>
-        <?= ($S === null) ? '<td class="txt">-</td>' : '<td class="num">'.fmt_dec($S, $decimals).'</td>' ?>
-        <?= ($W === null) ? '<td class="txt">-</td>' : '<td class="num">'.fmt_dec($W, $decimals).'</td>' ?>
-      <?php endforeach; ?>
-    </tr>
-  <?php endforeach; ?>
-</table>
-
-<p style="font-size:12px;color:#555;margin-top:10px;">
-  Примечание: усреднение по ролям — равными долями только по реально присутствующим ролям (3→1/3; 2→1/2; 1→1).
-  Числа в таблице усечены до <?= (int)$decimals ?> знаков (визуальная политика Excel без ROUND).
-</p>
-
-</body>
-</html>
+})();
